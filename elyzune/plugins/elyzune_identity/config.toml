@@ -1,0 +1,28 @@
+# elyzune-identity: the proxy half of Elyzune's hybrid login (AGENTS.md,
+# user decision of 13 October 2026; the plugin's own docs explain the flow).
+# A name owned by a paid Mojang account must authenticate with Mojang; every
+# other name logs in offline and registers or logs in with a password on the
+# game server. Every player keeps the OfflinePlayer:<name> UUID.
+#
+# Paths are relative to Infrarust's working directory (this elyzune/ folder).
+
+# Mojang's profile-by-name lookup (the default, written out).
+profile_url = "https://api.mojang.com/users/profiles/minecraft"
+# One lookup's whole budget. A lookup that fails refuses the login (the
+# player is told to try again): an unknown owner never becomes a password name.
+timeout_ms = 3000
+# A paid name whose Mojang login failed is refused at once for this long.
+failed_auth_seconds = 600
+language_file = "lang.toml"
+language = "en"
+
+[cache]
+paid_seconds = 21600
+free_seconds = 600
+capacity = 100000
+
+# Mojang allows about 600 lookups per 10 minutes per address: a burst of
+# 300, then one every 2 s, never exceeds it.
+[rate]
+burst = 300
+refill_ms = 2000

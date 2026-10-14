@@ -1,0 +1,31 @@
+[package]
+name = "elyzune-identity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+description = "Elyzune's hybrid login on the proxy: paid Mojang names authenticate with Mojang, every other name logs in with a password on the game server"
+keywords = ["minecraft", "proxy", "plugin", "authentication"]
+categories = ["game-development", "authentication"]
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+infrarust-api = { workspace = true }
+dashmap = { workspace = true }
+governor = { workspace = true }
+md-5 = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["fs", "time"] }
+toml = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+infrarust-api = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "io-util"] }

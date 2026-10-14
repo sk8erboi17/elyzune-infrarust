@@ -1,0 +1,676 @@
+---
+title: Global Settings
+description: Reference for infrarust.toml. Bind address, workers, timeouts, rate limits, keepalive, bans, forwarding, ip_filter, web admin API, permissions, WASM plugin limits, and other proxy-wide settings.
+outline: [2, 3]
+---
+
+# Global Settings
+
+The `infrarust.toml` file controls the proxy process itself: what address it listens on, how many threads it uses, and how it handles connections before they reach any backend server.
+
+Every field has a default value. An empty file (or no file at all) starts the proxy on `0.0.0.0:25565` with sane defaults.
+
+The config struct uses `serde(deny_unknown_fields)`, so unrecognized keys are a hard parse error rather than a silent no-op.
+
+## Bind address and port
+
+```toml
+bind = "0.0.0.0:25565"
+```
+
+The socket address the proxy listens on. The format is `ip:port`. Set the IP to `127.0.0.1` to accept connections only from localhost, or `0.0.0.0` to accept from any interface.
+
+To run on a non-standard port:
+
+```toml
+bind = "0.0.0.0:25577"
+```
+
+## Worker threads
+
+```toml
+worker_threads = 0
+```
+
+Number of Tokio async runtime threads. `0` (the default) lets the runtime pick a count based on available CPU cores. Set this explicitly if you want to cap CPU usage on a shared host.
+
+## Connection limits
+
+```toml
+max_connections = 0
+```
+
+Maximum simultaneous client connections. `0` means unlimited. When the limit is reached, the proxy stops accepting connections until existing ones close: new clients wait in the operating system's backlog instead of being refused.
+
+## Timeouts
+
+```toml
+connect_timeout = "5s"
+```
+
+How long the proxy waits when opening a TCP connection to a backend server. If the backend doesn't respond within this window, the connection attempt fails and the player sees an error.
+
+```toml
+connect_max_attempts = 3
+```
+
+How many of a server's backend addresses the proxy tries before giving up, which bounds worst-case login latency to `connect_max_attempts × connect_timeout`. Set it to `0` to try every address. See [Load balancing](./load-balancing).
+
+All duration fields accept human-readable strings: `"5s"`, `"30s"`, `"1m"`, `"2m30s"`.
+
+## Backend health probing
+
+```toml
+[active_health]
+enabled = true
+kind = "tcp"
+unhealthy_interval = "10s"
+probe_healthy = false
+interval = "30s"
+timeout = "3s"
+max_concurrent = 8
+```
+
+Background probing that brings ejected backend addresses back into rotation. Recovery probing is on by default and only touches addresses that are currently ejected, so it costs nothing while everything is healthy. Every key is documented in [Load balancing](./load-balancing), and any server can override the whole block.
+
+## Server and plugin directories
+
+```toml
+servers_dir = "./servers"
+plugins_dir = "./plugins"
+```
+
+`servers_dir` is the path to the directory containing per-server `.toml` files. `plugins_dir` is where Infrarust looks for WASM plugin files, directly in the directory: subdirectories are not scanned, since they hold the plugins' data directories. Both are resolved from the working directory where Infrarust starts. See the [Configuration Overview](./) for the per-server config format.
+
+## Announce proxy commands
+
+```toml
+announce_proxy_commands = true
+```
+
+When `true` (the default), the proxy adds its built-in `/ir` command tree and the plugin commands each player may run to the Minecraft command graph packet the backend sends, and replaces any backend command with the same name. When a plugin registers or removes a command, connected players get the updated tree right away. Set to `false` to hide the proxy command suggestions from the player's tab completion; the commands still run.
+
+## Proxy protocol
+
+```toml
+receive_proxy_protocol = false
+```
+
+When `true`, the proxy expects incoming connections to start with a HAProxy PROXY protocol header (v1 or v2). Enable this if Infrarust sits behind a load balancer that sends proxy protocol, such as HAProxy or AWS NLB. The address from the header is the player's address everywhere: IP bans and filters, `PreLoginEvent.remote_addr` and `Player::remote_addr()`.
+
+::: warning
+Only enable this if your upstream actually sends proxy protocol headers. Regular Minecraft clients do not, and connections will fail if this is on without a proxy protocol source.
+:::
+
+## SO_REUSEPORT
+
+```toml
+so_reuseport = false
+```
+
+Enables the `SO_REUSEPORT` socket option, which allows multiple processes to bind to the same port. This is a Linux-only option and has no effect on other platforms. Useful when running multiple Infrarust instances behind a kernel-level load balancer.
+
+## Unknown domain behavior
+
+```toml
+unknown_domain_behavior = "default_motd"
+```
+
+What happens when a player connects with a domain that doesn't match any server definition.
+
+| Value | Behavior |
+|-------|----------|
+| `default_motd` | Respond with the MOTD defined in `[default_motd]` (default) |
+| `drop` | Close the connection silently |
+
+The setting also covers legacy clients (Beta to 1.6). A Beta or 1.4 ping carries no hostname and counts as an unknown domain.
+
+## Rate limiting
+
+```toml
+[rate_limit]
+enabled = false
+max_connections = 3
+window = "10s"
+status_max = 300
+status_window = "10s"
+```
+
+Controls how many connections a single IP can make within a sliding time window. Rate limiting is disabled by default; set `enabled = true` to activate it. Login attempts and status pings have separate limits.
+
+`max_connections` is the number of login attempts allowed per IP within `window`. `status_max` and `status_window` do the same for server-list ping requests. The defaults allow 3 login attempts and 300 status pings per 10-second window per IP.
+
+## Status cache
+
+```toml
+[status_cache]
+ttl = "5s"
+max_entries = 1000
+```
+
+The proxy caches server-list ping responses to avoid hammering backend servers. `ttl` is how long a cached response stays valid. `max_entries` caps the cache size.
+
+If you run many backend servers and see stale ping data, lower the `ttl`. If memory is a concern, lower `max_entries`.
+
+## TCP keepalive
+
+```toml
+[keepalive]
+time = "30s"
+interval = "10s"
+retries = 3
+```
+
+TCP keepalive probes detect dead connections at the OS level. After a connection sits idle for `time`, the OS sends a probe every `interval`. After `retries` failed probes, the connection is closed.
+
+These values apply to both player-to-proxy and proxy-to-backend connections.
+
+## Ban system
+
+```toml
+[ban]
+provider = "builtin"
+file = "bans.json"
+purge_interval = "300s"
+enable_audit_log = true
+
+[events]
+handler_timeout = "10s"
+slow_handler_threshold = "1s"
+packet_handler_timeout = "10s"
+disconnect_deadline = "15s"
+transport_filter_timeout = "5s"
+```
+
+`provider` picks who decides who is banned: `"builtin"` (the default) uses the ban file, `"none"` turns ban checks off, and a plugin id hands bans to that plugin. See [Bans](./security/bans#choosing-a-provider). `file` is the path to the JSON file where the built-in provider stores bans. `purge_interval` controls how often expired bans are removed from the file. When `enable_audit_log` is `true`, every ban and unban operation is logged. `check_timeout` (default `5s`) bounds each ban check: a login whose check gets no answer in time is refused, a server list ping is answered.
+
+## Default MOTD
+
+```toml
+[default_motd.online]
+text = "§cUnknown server"
+version_name = "Infrarust"
+max_players = 0
+```
+
+The MOTD shown when a player pings a domain that doesn't match any server. The table accepts the same states as a server's `[motd]`: `online`, `sleeping`, `starting`, `crashed`, `stopping`, `unreachable`. Any other key is a parse error. The unknown-domain response uses `online`. `unreachable` is the fallback for a server that is unreachable and has neither its own `unreachable` entry nor a cached status; the other states are not used here.
+
+Each MOTD entry supports these fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `text` | string | MOTD text, supports Minecraft `§` formatting codes |
+| `favicon` | string | Path to a 64x64 PNG, a base64 string, or a URL |
+| `version_name` | string | Version text shown in the client |
+| `max_players` | integer | Max player count displayed in the server list |
+
+## Telemetry
+
+```toml
+[telemetry]
+enabled = true
+endpoint = "http://localhost:4317"
+protocol = "grpc"
+
+[telemetry.metrics]
+enabled = true
+export_interval = "15s"
+
+[telemetry.traces]
+enabled = true
+sampling_ratio = 0.1
+
+[telemetry.resource]
+service_name = "infrarust"
+```
+
+Infrarust can export metrics and traces via OpenTelemetry. The `[telemetry]` section is absent by default (no telemetry); add it and set `enabled = true` to activate export. Point `endpoint` at your OTLP collector; when omitted, the OpenTelemetry SDK default is used.
+
+`protocol` is either `"grpc"` or `"http"`, matching the OTLP export protocol your collector expects.
+
+`sampling_ratio` controls what fraction of status ping traces are sampled (0.0 to 1.0). Login traces are always sampled at 100% regardless of this value.
+
+`service_name` is set as an OTEL resource attribute. `service_version` defaults to the Infrarust binary version and is usually left unset.
+
+::: tip
+Omitting the `[telemetry]` section entirely disables telemetry. No collector connection is attempted.
+:::
+
+## Docker provider
+
+```toml
+[docker]
+endpoint = "unix:///var/run/docker.sock"
+poll_interval = "30s"
+reconnect_delay = "5s"
+```
+
+Enables automatic server discovery from Docker container labels. `endpoint` is the Docker daemon socket or HTTP API URL. `network` (optional) specifies which Docker network to use when resolving container addresses.
+
+The provider uses Docker events for real-time updates and falls back to polling every `poll_interval` if the event stream disconnects. After a disconnect, it waits `reconnect_delay` before reconnecting.
+
+<!-- Link to Docker discovery docs when available -->
+
+::: info
+The `[docker]` section is optional. Omit it entirely to disable Docker discovery.
+:::
+
+## IP filter
+
+```toml
+[ip_filter]
+whitelist = ["10.0.0.0/8", "192.168.0.0/16"]
+blacklist = ["10.6.6.0/24"]
+```
+
+Global IP filtering using CIDR ranges. An IP is allowed when it is not in the `blacklist` and (the `whitelist` is empty or the IP is in the `whitelist`). The blacklist always wins: a blacklisted address inside a whitelisted range is still rejected.
+
+If `whitelist` is empty, all IPs are allowed except those in `blacklist`. Both lists can be used together.
+
+Individual servers can define their own `[ip_filter]` in addition to, or instead of, the global one.
+
+## Forwarding
+
+```toml
+[forwarding]
+mode = "none"
+secret_file = "forwarding.secret"
+```
+
+Player IP forwarding passes the real client IP and UUID to backend servers. The `mode` values are:
+
+| Mode | Description |
+|------|-------------|
+| `none` | No forwarding (default) |
+| `bungee_cord` / `legacy` | BungeeCord-style legacy forwarding in the handshake |
+| `bungee_guard` | BungeeCord forwarding with a shared HMAC token |
+| `velocity` / `modern` | Velocity modern forwarding (recommended if your backends support it) |
+
+`secret_file` is the path to the shared secret used by `bungee_guard` and `velocity`. The file is created automatically if it does not exist.
+
+The BungeeCord forwarding modes only concern the handshake. The `BungeeCord` plugin messaging channel, which backend plugins use to ask the proxy things, is set up in [`[plugin_messaging]`](#plugin-messaging). `bungeecord_channel` and `[forwarding.channel_permissions]` used to sit here and were never acted on: they still load, are ignored, and log a warning pointing to the new keys.
+
+::: warning
+BungeeCord legacy forwarding sends the real IP in plain text in the handshake. Anyone who can reach your backend port can spoof it. Use `bungee_guard` or `velocity` if you need IP forwarding and cannot fully firewall the backend.
+:::
+
+## Authentication
+
+```toml
+[auth]
+session_url = "https://sessionserver.mojang.com/session/minecraft/hasJoined"
+offline_uuid = "offline"
+```
+
+`session_url` is the endpoint `client_only` mode calls to verify a joining player. It defaults to Mojang's, so you only set it when your accounts live somewhere else.
+
+Point it at an [authlib-injector](https://github.com/yushijinhun/authlib-injector) deployment or any other Yggdrasil-compatible server to authenticate against that instead. Give the complete endpoint URL rather than just the host, since implementations differ in how they prefix their routes — most authlib-injector servers expose it under `/authlib-injector/sessionserver/session/minecraft/hasJoined`.
+
+The setting has no effect in any other proxy mode: `offline` never authenticates, and the forwarding modes leave authentication to the backend.
+
+`offline_uuid` decides the UUID of a player who is not verified by the session server: every player on an `offline` or passthrough server, and a `client_only` player let in with `ForceOffline`.
+
+| Value | UUID |
+|-------|------|
+| `"offline"` (default) | The name-based offline UUID, the one a vanilla server in offline mode computes: an MD5 UUID of `OfflinePlayer:<name>`. The same name always gets the same UUID |
+| `"client"` | The UUID the client sends in its login start packet (1.19.1 and later). Clients that send none get the name-based offline UUID |
+
+With `"offline"` a client cannot choose its own UUID. Use `"client"` only when the connection comes from something you trust to set it, such as another proxy in front of Infrarust. The UUID is never random: it is what plugins see in `PreLoginEvent`, `PostLoginEvent` and the player registry, what UUID bans match, and what forwarding sends to the backend.
+
+::: warning
+Every player who reaches a `client_only` server is verified against this URL. Pointing it at a server you do not control means letting that server decide who may join.
+:::
+
+## Web admin API
+
+```toml
+[web]
+enable_api = true
+enable_webui = true
+bind = "127.0.0.1:8080"
+api_key = "your-api-key-here"
+
+[web.rate_limit]
+requests_per_minute = 60
+```
+
+Enables the HTTP admin API (and optional web UI) used by management tools and the CLI. The section is optional; omit it entirely to keep the web interface off. `enable_webui` follows `enable_api` when you do not set it, so `enable_api = false` on its own turns both off. Setting `enable_webui = true` next to `enable_api = false` is rejected at startup, since the dashboard is served by the API's own HTTP server and calls it for every screen.
+
+`bind` defaults to `127.0.0.1:8080`. If you bind to a non-loopback address, `api_key` is required. A key shorter than 16 characters is refused on any bind, and the placeholder `CHANGE-ME` counts as no key. When bound to loopback without a key, Infrarust generates an ephemeral key at startup and prints it once on stdout; the log only gets a warning that a key was generated, not the key.
+
+`cors_origins` accepts a list of allowed CORS origins (empty by default, meaning no cross-origin access).
+
+The API can rewrite this file through `PUT /api/v1/config/proxy/raw`. Nothing is hot-applied: the proxy keeps running on the configuration it started with until you restart it. Reads replace `api_key` with `<redacted>` and a write puts the stored value back, so editing the config through the dashboard cannot destroy the key. A write is refused when it carries `<redacted>` and there is no stored key to restore, and the proxy refuses to start if `<redacted>` ever reaches the file itself. See [Admin API & Web UI](../plugins/builtin/admin-api).
+
+::: danger
+Never expose the admin API on a public interface without a strong `api_key`. There is no second authentication layer.
+:::
+
+## Permissions
+
+```toml
+[permissions]
+provider = "builtin"
+admins = ["PlayerName", "AnotherPlayer"]
+player_commands = []
+trust_offline_admins = false
+```
+
+`provider` picks who answers permission questions: `"builtin"` (the default) uses the options below, and any other value is the id of the plugin that provides permissions. When that plugin never registers, players only get the node defaults.
+
+`admins` is a list of player names (or UUIDs) who hold `infrarust.admin` and every other node. Admins can run all `/ir` subcommands including `broadcast`, `kick`, `reload`, `send`, `plugin`, and `plugins`. An admin must have authenticated in online mode unless `trust_offline_admins` is `true`.
+
+`player_commands` lists the `/ir` subcommands every player can run, among `help`, `version`, `list`, `find`, and `server` (`"*"` for all five). By default, non-admin players cannot run any.
+
+The section is read at startup; changing it needs a restart. See [Permissions](./security/permissions) for nodes, defaults and permission plugins.
+
+## Plugin event handlers
+
+```toml
+[events]
+handler_timeout = "10s"
+slow_handler_threshold = "1s"
+packet_handler_timeout = "10s"
+disconnect_deadline = "15s"
+transport_filter_timeout = "5s"
+```
+
+Limits on the event listeners and transport filters that plugins register. A listener that panics is skipped and the event moves on to the next listener, so a buggy plugin can't take down a player's connection or the proxy. Whatever the listener changed on the event before it panicked is kept.
+
+`handler_timeout` caps how long one async listener may run for a regular event such as `PreLoginEvent` or `ChatMessageEvent`. When it runs out, the proxy cancels that listener and continues with the next one, so a stuck plugin delays a login by this much at most. `packet_handler_timeout` does the same for raw packet listeners.
+
+`slow_handler_threshold` logs a warning for any listener that takes longer than this. Synchronous listeners can't be interrupted, so one that runs past `handler_timeout` finishes anyway and shows up as slow rather than timed out.
+
+`transport_filter_timeout` caps how long one native plugin's transport filter may take to answer `on_accept` for a new connection. Unlike an event listener, a transport filter that runs out of time or panics does not let the connection through: the proxy closes that connection without an answer and logs a warning naming the filter and its plugin. The filters run in each connection's own task, so a slow filter delays only the connection it is deciding on. See [transport filters](../plugins/dev/architecture#layer-1-transportfilter).
+
+`disconnect_deadline` bounds the whole `DisconnectEvent` dispatch for one player, every listener included. When a player leaves, the proxy runs the `DisconnectEvent` listeners and removes the player from the registry once they are done, or once this deadline passes, whichever comes first. Listeners still running at the deadline are cancelled and a warning is logged. The same deadline bounds how long a second login with the same UUID waits for the first session to finish its `DisconnectEvent`. See [the player lifecycle](../plugins/dev/events#player-lifecycle).
+
+Listener panics and timeouts are logged at error level, slow listeners at warn level, and each log line names the plugin and the event. A transport filter's panic or timeout is logged at warn level with the filter id and the plugin. All five values must be greater than zero.
+
+## Plugin messaging
+
+```toml
+[plugin_messaging]
+bungeecord = false
+
+[plugin_messaging.bungeecord_permissions]
+connect = true
+connect_other = false
+ip = true
+ip_other = true
+player_count = true
+player_list = true
+get_servers = true
+get_server = true
+get_player_server = true
+forward = true
+forward_to_player = true
+uuid = true
+uuid_other = true
+server_ip = true
+message = false
+message_raw = false
+kick_player = false
+kick_player_raw = false
+```
+
+`bungeecord` lets the proxy answer the requests backend plugins send on the `BungeeCord` channel (`bungeecord:main` since 1.13): move a player, count and list players, forward a message to another server. It is off by default, and it only applies to the servers that also set [`bungeecord_channel = true`](./servers#proxy-behavior). For any other server, or while `bungeecord` is off, a BungeeCord message is forwarded to the client as before. Requests only see the requesting server's [network](./servers#identity).
+
+`bungeecord_permissions` allows each subchannel. Reads are allowed by default. `connect_other`, `message`, `message_raw`, `kick_player` and `kick_player_raw` act on other players and are off by default. The keys also accept the subchannel names (`ConnectOther`, `KickPlayer`...). A refused subchannel gets no answer.
+
+See [Plugin messaging](../plugins/dev/messaging#the-bungeecord-channel) for the request and response formats. The section is read at startup.
+
+## WASM plugin sandbox
+
+```toml
+[wasm]
+epoch_tick = "1ms"
+memory_limit_mb = 64
+cpu_budget = "3s"
+codec_cpu_budget = "5ms"
+host_call_timeout = "30s"
+max_call_duration = "60s"
+queue_capacity = 1024
+instance_pool = 0
+cache_dir = "./cache/wasm"
+```
+
+Limits that apply to every WASM plugin. Each plugin runs in its own sandbox and handles one call at a time: its event listeners, commands, scheduled tasks and limbo callbacks wait in a queue and run in order.
+
+| Key | What it limits |
+|-----|----------------|
+| `epoch_tick` | How often the sandbox clock ticks. CPU budgets are counted in ticks during which the guest runs, rounded up to a whole number of them, and a guest that runs past a tick yields its worker thread. The ticking thread costs about 0.4% of one core at 1 ms. Proxy-wide only. |
+| `memory_limit_mb` | Linear memory of one plugin, in MiB. A plugin that grows past it traps. |
+| `cpu_budget` | CPU time one call into a plugin may use before it traps. Time spent waiting on a host call (a ban lookup, a server start) does not count. |
+| `codec_cpu_budget` | The same budget for each codec filter call (`create`, `filter`, the connection hooks and the final drop). A filter call runs on a network worker thread and holds it, so this bounds what one call can cost the other connections. See [Codec filters](../plugins/wasm/codec-filters#hot-path-and-the-cpu-budget). |
+| `host_call_timeout` | How long one host call that waits on the proxy may take: server-manager `start` and `stop`, every ban-service call, `connect`, `transfer`, `request-cookie` and `refresh-permissions` on `players`, `fire-named`, `set-snapshot` and `release` on `permissions`, and the timeouts of each HTTP request. When it runs out the plugin gets a `host-error` of kind `timeout` and carries on. `switch-server` has its own 250 ms cap. A host call also ends early, with the same error, shortly before the deadline of the call it belongs to (a margin before `[events] handler_timeout` for an event, `max_call_duration` after it was queued for a command, a scheduled task or a limbo callback), so the plugin always gets to decide. |
+| `max_call_duration` | Wall-clock limit on one call into a plugin, host calls included. A call still running at this limit is abandoned and the plugin's instance is replaced by a fresh one. It is also the deadline of a command, a tab completion, a scheduled task or a limbo callback, counted from when the call is queued. |
+| `queue_capacity` | How many calls may wait for a busy plugin. When the queue is full a new call is refused on the spot: an event gets no answer from that plugin (an access event is then denied, see below) and a command does nothing. The refusal is logged as a warning, at most once every 5 seconds per plugin. |
+| `instance_pool` | Proxy-wide only. `0` (the default) creates every WASM instance on demand. A positive value reserves that many instance slots at startup and recycles them, which cuts the cost of building the codec filter instances of a new connection by about 40%. Count one slot per loaded plugin plus two per connection and per codec filter plugin, since each connection side gets its own instance. When every slot is taken, a codec filter instance cannot be built and that connection side passes packets through unfiltered (or the connection is refused, for a [required filter](../plugins/wasm/codec-filters#required-filters)), with an error in the log limited to 10 a minute per filter, and no plugin can be loaded or restarted until a slot frees up. While the pool is on, a plugin whose function table has more than 512 entries cannot be loaded. See [Instance memory and address space](#instance-memory-and-address-space) for what a slot reserves and keeps resident. |
+| `cache_dir` | Proxy-wide only. Directory of the AOT cache, where each plugin is kept compiled to native code so that later starts skip compilation. Resolved from the working directory, like `plugins_dir`. It must not be `plugins_dir` or a directory inside it, since whoever may add plugin files must not be able to plant native code; keep it writable by the proxy user only. When it cannot be created or written, the proxy logs one warning and compiles the plugins in memory at each start. Entries no plugin uses are removed after each start, so give each proxy its own directory. See [AOT compilation and caching](../plugins/wasm/lifecycle#aot-compilation-and-caching). |
+
+Every call into a WASM plugin has a deadline: `[events] handler_timeout` minus a margin (a fifth, at most 250 ms) for an event listener, a ban check or a permission snapshot, and `max_call_duration` after it was queued for a command, a tab completion, a scheduled task or a limbo callback. A ban check ends at `[ban] check_timeout` when that comes first. A call still running at its deadline is cut off, the plugin's instance is replaced by a fresh one, and the cut counts as a fault toward `[wasm.recovery]` with the cause `the call ran past the event deadline`. One slow call therefore costs its own event and a fresh instance, and the calls queued behind it run within their own deadlines. A call that is still queued at its deadline is dropped without running.
+
+When a WASM listener gives no answer to an event (it ran past the deadline, its queue was full, it trapped, or the plugin is recovering or quarantined), the proxy decides for it. The access events `PreLoginEvent`, `LoginEvent`, `GameProfileRequestEvent`, `PlayerChooseInitialServerEvent`, `ServerPreConnectEvent` and `PreTransferEvent` are denied with "A proxy plugin is unavailable. Please try again later.", and `PermissionsSetupEvent` leaves the player with the node defaults. Every other event keeps the result it had, as with a native listener. A quarantined plugin that listens to `PreLoginEvent` therefore closes the proxy to new logins until its backoff passes. A native listener that panics or times out is skipped instead, whatever the event. See [WASM events](../plugins/wasm/events#a-listener-that-does-not-answer).
+
+A trap (a panic in the plugin, a memory or CPU overrun) does not disable the plugin for good. The proxy throws the faulty instance away, starts a fresh one from the compiled plugin and runs its `on_enable` again. Anything the plugin kept only in memory is lost; files in its data directory are kept. A plugin that keeps failing is quarantined for a while, as set in `[wasm.recovery]` below. See [Fault model](../plugins/wasm/fault-model).
+
+Startup fails when a value is out of range:
+
+- `epoch_tick` must be between `1ms` and `1s`.
+- `memory_limit_mb` must be between 1 and 4096.
+- `cpu_budget` must be at least one `epoch_tick` and at most `1h`; `codec_cpu_budget` must be greater than zero and at most `1h`.
+- `host_call_timeout` and `max_call_duration` must be greater than zero and at most `1h`.
+- `queue_capacity` must be between 1 and 1048576.
+- `instance_pool` must be at most 32768.
+- `cache_dir` must not be empty, and must not be `plugins_dir` or lie inside it, compared on the absolute paths with `.` and `..` resolved.
+
+The proxy logs a warning, without refusing to start, when `cpu_budget` is longer than `max_call_duration`: the wall-clock limit then stops a busy guest call first instead of the CPU budget trapping it. It also warns when `codec_cpu_budget` is shorter than `epoch_tick` (for example a configuration that still sets `epoch_tick = "50ms"` and keeps the 5 ms codec budget): a codec call then gets one tick.
+
+### Instance memory and address space
+
+Every WASM instance reserves about 4 GiB of virtual address space for its linear memory: one instance per loaded plugin, plus one per connection side for each codec filter plugin. The reservation is not memory. It lets the compiled plugin code skip bounds checks on memory accesses, and only the pages a plugin touches take RAM. The address space is finite, though. A 64-bit Linux process has 128 TiB of it, so the proxy can hold about 32 000 live instances; a virtual memory limit (`ulimit -v`, systemd `LimitAS=`, a container runtime setting) lowers the ceiling to one instance per 4 GiB of the limit. Past the ceiling, building an instance fails: a codec filter side passes packets through unfiltered (a [required filter](../plugins/wasm/codec-filters#required-filters) refuses the connection instead), with an error in the log limited to 10 a minute per filter, and a plugin cannot be loaded or restarted. The proxy does not cap the number of instances on its own; with the default on-demand allocation, this ceiling is the cap.
+
+With `instance_pool` set, the address space of every slot is reserved once at startup, about 4 GiB per slot. When that reservation fails the proxy logs a warning and falls back to on-demand allocation. Only the slots in use take memory, and a slot gives its memory back when its instance ends (the connection closes, or the plugin is unloaded or replaced).
+
+Each pooled instance has room for two function tables of 4 KiB, 512 entries each. A plugin takes one entry per function it reaches through a function pointer or a trait object; the plugins built with the SDK in the Infrarust repository use between 70 and 300. A plugin with a larger table fails to load with `module table does not fit in pooling allocator requirements: table index 0 has a minimum element size of <n> which exceeds the limit of 512`; run it with `instance_pool = 0`, where tables have no fixed size. Its AOT cache entry is kept, and loads once the pool is off.
+
+Transparent huge pages set to `always` (`/sys/kernel/mm/transparent_hugepage/enabled`) let the kernel back the pool's tables with 2 MiB pages. The tables of a closed connection are still given back, but a 2 MiB page that holds a table still in use can stay resident as a whole. All pooled tables together take 8 KiB per slot (32 MiB for 4096 slots), which bounds that effect. With `madvise` or `never`, only the pages in use are resident.
+
+### Recovery after a fault
+
+```toml
+[wasm.recovery]
+max_restarts = 5
+window = "5m"
+backoff_initial = "1s"
+backoff_max = "5m"
+```
+
+After a fault the proxy starts a fresh instance of the plugin straight away, up to `max_restarts` times within `window`. The next fault inside the window quarantines the plugin for `backoff_initial`, doubled for each quarantine in a row up to `backoff_max`. While a plugin is quarantined its events keep their result, its commands do nothing and its limbo handlers deny the player, all without waiting. Once the backoff has passed the proxy tries a fresh instance again.
+
+| Key | What it controls |
+|-----|------------------|
+| `max_restarts` | Fresh instances started straight away within `window`. `0` quarantines the plugin on its first fault. |
+| `window` | Sliding window over which restarts are counted. |
+| `backoff_initial` | Length of the first quarantine, and the pause before the next attempt when no fresh instance could be created at all. |
+| `backoff_max` | Longest a quarantine lasts. |
+
+Each fault is logged at error level with the plugin, the call and the cause. A successful recovery is logged at info level with the instance generation, and a quarantine at warn level with the time until the next attempt. When the proxy cannot create an instance at all (the instance pool or the address space is exhausted, the data directory cannot be opened), it logs that at error level and waits `backoff_initial` before the next attempt; each attempt counts against `max_restarts`. While the proxy shuts down, no fresh instance is started.
+
+Startup fails when `max_restarts` is above 1000, when `window`, `backoff_initial` or `backoff_max` is zero or longer than `24h`, or when `backoff_initial` is longer than `backoff_max`.
+
+### Codec filter quarantine
+
+```toml
+[wasm.codec_quarantine]
+faults = 5
+window = "10s"
+backoff_initial = "10s"
+backoff_max = "5m"
+```
+
+A codec filter that traps (a panic, running past `codec_cpu_budget`, running out of memory) for connections from one client address is quarantined for that address. When one address reaches `faults` traps of the same filter within `window`, the filter's live instances on that address's connections stop filtering, and its new connections get no instance of the filter for `backoff_initial`: their packets pass through unfiltered, or, for a filter the plugin declared required, the connection is closed or refused. Other addresses keep the filter. A quarantine that follows a fault within `window` of the previous quarantine ending lasts twice as long, up to `backoff_max`; a whole `window` without a fault starts the backoff over. Each quarantine is logged as a warning with the plugin, the filter, the address, the time until retry and the cause, at most 10 a minute per filter. A failure to build an instance (no free `instance_pool` slot, no address space left) is not counted. See [Codec filters](../plugins/wasm/codec-filters#quarantine).
+
+| Key | What it controls |
+|-----|------------------|
+| `faults` | Traps of one filter from one address that trigger a quarantine. `0` turns the quarantine off. |
+| `window` | Sliding window over which the traps are counted. |
+| `backoff_initial` | Length of the first quarantine of an address. |
+| `backoff_max` | Longest a quarantine lasts. |
+
+Startup fails when `faults` is above 1000000, when `window`, `backoff_initial` or `backoff_max` is zero or longer than `24h`, or when `backoff_initial` is longer than `backoff_max`. `[plugins.<id>.wasm.codec_quarantine]` sets other values for the filters of one plugin.
+
+### Registration quotas
+
+```toml
+[wasm.quotas]
+event_listeners = 1024
+commands = 256
+scheduled_tasks = 1024
+plugin_channels = 128
+codec_filters = 32
+limbo_handlers = 64
+permission_nodes = 256
+```
+
+Each key caps how many registrations of one kind a WASM plugin may hold at the same time. A quota counts what the plugin holds now, not what it ever registered: unsubscribing a listener, cancelling a task, or unregistering a command, a channel or a codec filter frees room, and a one-shot task stops counting once it has run. A registration past the quota is refused with a host error of kind `limit-exceeded`, and the plugin keeps what it already held. The proxy logs a warning naming the plugin and the quota, at most once a minute per quota for each plugin instance.
+
+| Key | What it counts |
+|-----|----------------|
+| `event_listeners` | Event and named-event subscriptions, plus one per packet filter of each packet subscription. |
+| `commands` | Commands the plugin registered. Registering a name it already holds replaces that command and takes no more room. |
+| `scheduled_tasks` | Delays that have not run yet and intervals that are not cancelled. |
+| `plugin_channels` | Plugin messaging channels the plugin registered. |
+| `codec_filters` | Codec filter ids the plugin registered. |
+| `limbo_handlers` | Limbo handler names the plugin registered. |
+| `permission_nodes` | Permission nodes the plugin registered. Registering a node it already owns updates it and takes no more room. A node is removed only when the plugin is disabled or unloaded. |
+
+A plugin that propagates a refused registration with `?` in `on_enable` fails to enable, as with any other host error. After a fault, the listeners, tasks, commands and limbo handlers of the discarded instance do not count against the fresh one; plugin channels, codec filters and permission nodes are kept across a recovery and keep counting. `[plugins.<id>.wasm.quotas]` sets other quotas for one plugin.
+
+Startup fails when a quota is 0 or above 1048576.
+
+## Plugins
+
+```toml
+[plugins.my_plugin]
+permissions = ["ban", "limbo"]
+deny = ["player-write"]
+strict_capabilities = false
+enabled = true
+
+[plugins.my_plugin.wasm]
+memory_limit_mb = 128
+queue_capacity = 256
+```
+
+Plugin configurations are keyed by plugin ID.
+
+- `permissions` grants capabilities on top of the baseline every WASM plugin receives.
+- `deny` removes capabilities. It is applied after the baseline and the grants, so it can take away a baseline capability such as `player-write`, and a capability listed in both `permissions` and `deny` is denied. It also applies to compiled-in plugins.
+- `strict_capabilities` (WASM plugins, defaults to `false`) refuses to load the plugin when it imports a host function whose capability it lacks. Without it such a plugin loads, a warning names each import that will be refused, and the calls are refused when made. See [What a missing capability does](../plugins/wasm/capabilities#what-a-missing-capability-does).
+- `enabled` skips the plugin when set to `false` (defaults to `true` when omitted).
+- `[plugins.<id>.wasm]` overrides the `[wasm]` limits for that plugin. It accepts every key of `[wasm]` except the proxy-wide `epoch_tick`, `instance_pool` and `cache_dir`, `[plugins.<id>.wasm.recovery]` overrides `[wasm.recovery]`, `[plugins.<id>.wasm.quotas]` overrides `[wasm.quotas]` and `[plugins.<id>.wasm.codec_quarantine]` overrides `[wasm.codec_quarantine]`; keys it leaves out keep the proxy-wide value.
+- `[plugins.<id>.wasm.network]` lists the destinations a plugin with the `network` capability may reach, and `[[plugins.<id>.wasm.mounts]]` the host folders a plugin with `filesystem-extended` sees. See [Network & Extra Folders](../plugins/wasm/network).
+
+Unknown capability names in `permissions` or `deny` are ignored with a warning. The capability strings are listed in [Capabilities & Sandbox](../plugins/wasm/capabilities#capability-matrix). `path` is accepted for compatibility; WASM plugins are always discovered in `plugins_dir`.
+
+## Full example
+
+A complete `infrarust.toml` showing the main sections and their defaults:
+
+```toml
+bind = "0.0.0.0:25565"
+max_connections = 0
+connect_timeout = "5s"
+receive_proxy_protocol = false
+servers_dir = "./servers"
+plugins_dir = "./plugins"
+worker_threads = 0
+unknown_domain_behavior = "default_motd"
+so_reuseport = false
+announce_proxy_commands = true
+
+[rate_limit]
+enabled = false
+max_connections = 3
+window = "10s"
+status_max = 300
+status_window = "10s"
+
+[status_cache]
+ttl = "5s"
+max_entries = 1000
+
+[keepalive]
+time = "30s"
+interval = "10s"
+retries = 3
+
+[ban]
+file = "bans.json"
+purge_interval = "300s"
+enable_audit_log = true
+
+[wasm]
+epoch_tick = "1ms"
+memory_limit_mb = 64
+cpu_budget = "3s"
+codec_cpu_budget = "5ms"
+host_call_timeout = "30s"
+max_call_duration = "60s"
+queue_capacity = 1024
+cache_dir = "./cache/wasm"
+
+[wasm.recovery]
+max_restarts = 5
+window = "5m"
+backoff_initial = "1s"
+backoff_max = "5m"
+
+[wasm.codec_quarantine]
+faults = 5
+window = "10s"
+backoff_initial = "10s"
+backoff_max = "5m"
+
+[wasm.quotas]
+event_listeners = 1024
+commands = 256
+scheduled_tasks = 1024
+plugin_channels = 128
+codec_filters = 32
+limbo_handlers = 64
+permission_nodes = 256
+
+# [telemetry]
+# enabled = true
+# endpoint = "http://localhost:4317"
+# protocol = "grpc"
+#
+# [telemetry.metrics]
+# enabled = true
+# export_interval = "15s"
+#
+# [telemetry.traces]
+# enabled = true
+# sampling_ratio = 0.1
+#
+# [telemetry.resource]
+# service_name = "infrarust"
+
+# [ip_filter]
+# whitelist = []
+# blacklist = []
+
+# [forwarding]
+# mode = "none"
+# secret_file = "forwarding.secret"
+
+# [web]
+# bind = "127.0.0.1:8080"
+# api_key = "change-me-min-16-chars"
+
+# [permissions]
+# admins = []
+```

@@ -1,0 +1,228 @@
+//! Shared test utilities for the limbo module.
+
+#![cfg(test)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use bytes::{Bytes, BytesMut};
+use infrarust_api::event::BoxFuture;
+use tokio::net::{TcpListener, TcpStream};
+use uuid::Uuid;
+
+use std::sync::Mutex;
+
+use tokio_util::sync::CancellationToken;
+
+use infrarust_api::limbo::handler::{HandlerResult, LimboHandler, SessionEndReason};
+use infrarust_api::limbo::session::LimboSession;
+use infrarust_api::types::{GameProfile, PlayerId};
+use infrarust_protocol::io::PacketFrame;
+use infrarust_protocol::packets::Packet;
+use infrarust_protocol::registry::PacketRegistry;
+use infrarust_protocol::version::{ConnectionState, ProtocolVersion};
+
+use crate::ban::manager::BanManager;
+use crate::event_bus::bus::EventBusImpl;
+use crate::filter::codec_registry::CodecFilterRegistryImpl;
+use crate::filter::transport_registry::TransportFilterRegistryImpl;
+use crate::limbo::registry::LimboHandlerRegistry;
+use crate::limbo::registry_cache::RegistryCodecCache;
+use crate::player::registry::PlayerRegistryImpl;
+use crate::routing::DomainRouter;
+use crate::services::ProxyServices;
+use crate::services::command_manager::CommandManagerImpl;
+use crate::session::client_bridge::ClientBridge;
+use crate::session::connection_registry::ConnectionRegistry;
+
+pub fn test_profile() -> GameProfile {
+    GameProfile {
+        uuid: Uuid::nil(),
+        username: "LimboTester".to_string(),
+        properties: vec![],
+    }
+}
+
+pub fn test_registry() -> PacketRegistry {
+    infrarust_protocol::registry::build_default_registry()
+}
+
+pub fn build_frame<P: Packet>(
+    packet: &P,
+    version: ProtocolVersion,
+    registry: &PacketRegistry,
+) -> PacketFrame {
+    let packet_id = registry
+        .get_packet_id::<P>(version)
+        .expect("packet ID should exist in registry");
+    let mut payload = Vec::new();
+    packet.encode(&mut payload, version).unwrap();
+    PacketFrame::new(packet_id, Bytes::from(payload))
+}
+
+/// Returns `(server-side ClientBridge, raw client TcpStream)` via loopback.
+pub async fn test_client_bridge(version: ProtocolVersion) -> (ClientBridge, TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client_stream = TcpStream::connect(addr).await.unwrap();
+    let (server_stream, _) = listener.accept().await.unwrap();
+    let mut bridge = ClientBridge::new(server_stream, BytesMut::new(), version);
+    bridge.set_state(ConnectionState::Play);
+    (bridge, client_stream)
+}
+
+pub fn test_proxy_services() -> ProxyServices {
+    let connection_registry = Arc::new(ConnectionRegistry::new());
+    let backend_load = Arc::new(crate::loadbalancer::BackendLoad::new());
+    let backend_health = Arc::new(crate::loadbalancer::PassiveBackendHealth::new());
+    let domain_router = Arc::new(DomainRouter::new());
+    let packet_registry = Arc::new(test_registry());
+    let provider: Arc<dyn crate::registry_data::RegistryDataProvider> =
+        Arc::new(crate::registry_data::embedded::EmbeddedRegistryDataProvider);
+
+    let pending_backends = Arc::new(crate::loadbalancer::PendingRegistry::new(
+        Arc::clone(&backend_load) as _,
+        std::time::Duration::from_secs(10),
+    ));
+
+    ProxyServices {
+        event_bus: Arc::new(EventBusImpl::new()),
+        player_registry: Arc::new(PlayerRegistryImpl::new(Arc::clone(&connection_registry))),
+        command_manager: Arc::new(CommandManagerImpl::new()),
+        connection_registry,
+        load_balancer_service: Arc::new(
+            crate::services::load_balancer_service::LoadBalancerServiceImpl::new(
+                Arc::clone(&domain_router),
+                Arc::clone(&backend_health),
+                Arc::clone(&backend_load) as _,
+            ),
+        ),
+        pending_backends,
+        backend_load,
+        packet_registry,
+        server_manager: None,
+        ban_manager: Arc::new(BanManager::disabled(
+            Arc::new(ConnectionRegistry::new()),
+            Arc::new(EventBusImpl::new()),
+        )),
+        config: Arc::new(toml::from_str("").unwrap()),
+        config_path: std::path::PathBuf::from("infrarust.toml"),
+        domain_router,
+        backend_health,
+        codec_filter_registry: Arc::new(CodecFilterRegistryImpl::new()),
+        transport_filter_registry: Arc::new(TransportFilterRegistryImpl::new()),
+        limbo_handler_registry: Arc::new(LimboHandlerRegistry::new()),
+        registry_codec_cache: Arc::new(RegistryCodecCache::new(provider)),
+        provider_event_sender: tokio::sync::mpsc::channel(1).0,
+        forwarding_mode: Arc::new(crate::forwarding::ForwardingMode::None),
+        forwarding_secret: None,
+        permission_service: Arc::new(crate::permissions::PermissionService::new_sync(
+            &Default::default(),
+        )),
+        plugin_messaging: Arc::new(crate::plugin_messaging::PluginMessaging::default()),
+    }
+}
+
+pub struct FixedHandler {
+    pub name: &'static str,
+    pub result: HandlerResult,
+}
+
+impl LimboHandler for FixedHandler {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn on_player_enter<'a>(
+        &'a self,
+        _session: &'a dyn LimboSession,
+    ) -> BoxFuture<'a, HandlerResult> {
+        let result = self.result.clone();
+        Box::pin(async move { result })
+    }
+}
+
+pub struct TrackingHandler {
+    pub name: &'static str,
+    pub result: HandlerResult,
+    pub called: Arc<AtomicBool>,
+}
+
+impl LimboHandler for TrackingHandler {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn on_player_enter<'a>(
+        &'a self,
+        _session: &'a dyn LimboSession,
+    ) -> BoxFuture<'a, HandlerResult> {
+        self.called.store(true, Ordering::SeqCst);
+        let result = self.result.clone();
+        Box::pin(async move { result })
+    }
+}
+
+pub struct HoldHandler {
+    pub name: &'static str,
+}
+
+impl LimboHandler for HoldHandler {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn on_player_enter<'a>(
+        &'a self,
+        _session: &'a dyn LimboSession,
+    ) -> BoxFuture<'a, HandlerResult> {
+        Box::pin(async { HandlerResult::Hold })
+    }
+}
+
+pub struct SessionEndRecorder {
+    pub name: &'static str,
+    pub result: HandlerResult,
+    pub ended: Arc<Mutex<Vec<SessionEndReason>>>,
+}
+
+impl LimboHandler for SessionEndRecorder {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn on_player_enter<'a>(
+        &'a self,
+        _session: &'a dyn LimboSession,
+    ) -> BoxFuture<'a, HandlerResult> {
+        let result = self.result.clone();
+        Box::pin(async move { result })
+    }
+
+    fn on_session_end(&self, _player_id: PlayerId, reason: SessionEndReason) -> BoxFuture<'_, ()> {
+        self.ended.lock().unwrap().push(reason);
+        Box::pin(async {})
+    }
+}
+
+pub struct TokenCaptureHandler {
+    pub name: &'static str,
+    pub result: HandlerResult,
+    pub captured: Arc<Mutex<Option<CancellationToken>>>,
+}
+
+impl LimboHandler for TokenCaptureHandler {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn on_player_enter<'a>(
+        &'a self,
+        session: &'a dyn LimboSession,
+    ) -> BoxFuture<'a, HandlerResult> {
+        *self.captured.lock().unwrap() = Some(session.cancellation_token());
+        let result = self.result.clone();
+        Box::pin(async move { result })
+    }
+}

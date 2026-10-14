@@ -1,0 +1,212 @@
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use infrarust_api::services::ban_service::BanService;
+use infrarust_api::services::config_service::ConfigService;
+use infrarust_api::services::load_balancer::LoadBalancerService;
+use infrarust_api::services::player_registry::PlayerRegistry;
+use infrarust_api::services::plugin_registry::PluginRegistry;
+use infrarust_api::services::server_manager::ServerManager;
+use serde::Serialize;
+use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
+
+use crate::config::ApiConfig;
+use crate::drain_store::DrainStore;
+use crate::health_cache::HealthCache;
+use crate::health_checker::HealthChecker;
+use crate::log_layer::LogBroadcast;
+use crate::rate_limit::RateLimiter;
+use crate::server_dir::{ProviderSenderSlot, ServerDir};
+
+pub struct ApiState {
+    pub player_registry: Arc<dyn PlayerRegistry>,
+    pub ban_service: Arc<dyn BanService>,
+    pub server_manager: Arc<dyn ServerManager>,
+    pub config_service: Arc<dyn ConfigService>,
+    pub load_balancer: Arc<dyn LoadBalancerService>,
+    pub plugin_registry: Arc<dyn PluginRegistry>,
+    pub config: ApiConfig,
+    pub start_time: Instant,
+    pub proxy_version: String,
+    pub rate_limiter: RateLimiter,
+    pub event_tx: broadcast::Sender<ApiEvent>,
+    pub shutdown: CancellationToken,
+    pub proxy_shutdown: CancellationToken,
+    pub logs: Option<LogBroadcast>,
+    /// TOML documents for API-managed servers, under `<data_dir>/servers/`.
+    pub server_dir: Arc<ServerDir>,
+    /// Sender for emitting config provider events (Added/Updated/Removed).
+    pub provider_sender: Arc<ProviderSenderSlot>,
+    /// Cache of last health check result per server.
+    pub health_cache: Arc<HealthCache>,
+    /// Health checker for pinging Minecraft backends.
+    pub health_checker: Arc<HealthChecker>,
+    /// Ring buffer of recent activity events (last 100).
+    pub recent_events: Arc<Mutex<VecDeque<RecentEvent>>>,
+    /// Persisted drain intent, replayed after a restart.
+    pub drain_store: Arc<DrainStore>,
+}
+
+/// A summarized event for the activity feed.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecentEvent {
+    #[serde(rename = "type")]
+    pub event_type: String,
+    pub summary: String,
+    pub timestamp: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", content = "data")]
+#[non_exhaustive]
+pub enum ApiEvent {
+    PlayerJoin {
+        player_id: u64,
+        username: String,
+        uuid: String,
+        server: String,
+        timestamp: String,
+    },
+    PlayerLeave {
+        player_id: u64,
+        username: String,
+        last_server: Option<String>,
+        cause: String,
+        reason: Option<String>,
+        timestamp: String,
+    },
+    PlayerSwitch {
+        player_id: u64,
+        username: String,
+        from_server: Option<String>,
+        to_server: String,
+        timestamp: String,
+    },
+    ServerStateChange {
+        server_id: String,
+        old_state: String,
+        new_state: String,
+        timestamp: String,
+    },
+    ConfigReload {
+        provider: String,
+        added: Vec<String>,
+        removed: Vec<String>,
+        updated: Vec<String>,
+        timestamp: String,
+    },
+    BanCreated {
+        target_type: String,
+        target_value: String,
+        reason: Option<String>,
+        source: String,
+        timestamp: String,
+    },
+    BanRemoved {
+        target_type: String,
+        target_value: String,
+        timestamp: String,
+    },
+    BackendHealthChange {
+        address: String,
+        server_ids: Vec<String>,
+        state: String,
+        timestamp: String,
+    },
+    StatsTick {
+        players_online: usize,
+        servers_online: usize,
+        bans_active: usize,
+        uptime_seconds: u64,
+        memory_rss_bytes: Option<u64>,
+        timestamp: String,
+    },
+}
+
+const MAX_RECENT_EVENTS: usize = 100;
+
+impl ApiEvent {
+    pub fn event_type(&self) -> &'static str {
+        match self {
+            ApiEvent::PlayerJoin { .. } => "player.join",
+            ApiEvent::PlayerLeave { .. } => "player.leave",
+            ApiEvent::PlayerSwitch { .. } => "player.switch",
+            ApiEvent::ServerStateChange { .. } => "server.state_change",
+            ApiEvent::ConfigReload { .. } => "config.reload",
+            ApiEvent::BanCreated { .. } => "ban.created",
+            ApiEvent::BanRemoved { .. } => "ban.removed",
+            ApiEvent::BackendHealthChange { .. } => "backend.health_change",
+            ApiEvent::StatsTick { .. } => "stats.tick",
+        }
+    }
+
+    pub fn timestamp(&self) -> &str {
+        match self {
+            ApiEvent::PlayerJoin { timestamp, .. }
+            | ApiEvent::PlayerLeave { timestamp, .. }
+            | ApiEvent::PlayerSwitch { timestamp, .. }
+            | ApiEvent::ServerStateChange { timestamp, .. }
+            | ApiEvent::ConfigReload { timestamp, .. }
+            | ApiEvent::BanCreated { timestamp, .. }
+            | ApiEvent::BanRemoved { timestamp, .. }
+            | ApiEvent::BackendHealthChange { timestamp, .. }
+            | ApiEvent::StatsTick { timestamp, .. } => timestamp,
+        }
+    }
+
+    /// Convert to a summarized event for the activity feed.
+    /// Returns `None` for events that shouldn't appear in the feed (e.g. stats ticks).
+    pub fn to_recent(&self) -> Option<RecentEvent> {
+        let summary = match self {
+            ApiEvent::PlayerJoin {
+                username, server, ..
+            } => {
+                let srv = if server.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {server}")
+                };
+                format!("{username} joined{srv}")
+            }
+            ApiEvent::PlayerLeave { username, .. } => format!("{username} disconnected"),
+            ApiEvent::PlayerSwitch {
+                username,
+                to_server,
+                ..
+            } => format!("{username} switched to {to_server}"),
+            ApiEvent::ServerStateChange {
+                server_id,
+                old_state,
+                new_state,
+                ..
+            } => format!("{server_id}: {old_state} → {new_state}"),
+            ApiEvent::ConfigReload { .. } => "Config reloaded".to_string(),
+            ApiEvent::BanCreated {
+                target_type,
+                target_value,
+                ..
+            } => format!("Banned {target_value} ({target_type})"),
+            ApiEvent::BanRemoved { target_value, .. } => format!("Unbanned {target_value}"),
+            ApiEvent::BackendHealthChange { address, state, .. } => {
+                format!("Backend {address} is {state}")
+            }
+            ApiEvent::StatsTick { .. } => return None,
+        };
+        Some(RecentEvent {
+            event_type: self.event_type().to_string(),
+            summary,
+            timestamp: self.timestamp().to_string(),
+        })
+    }
+}
+
+/// Push an event to the recent events ring buffer.
+pub fn push_recent_event(recent_events: &Mutex<VecDeque<RecentEvent>>, event: &ApiEvent) {
+    if let Some(recent) = event.to_recent() {
+        let mut buffer = recent_events.lock().unwrap_or_else(|p| p.into_inner());
+        buffer.push_front(recent);
+        buffer.truncate(MAX_RECENT_EVENTS);
+    }
+}

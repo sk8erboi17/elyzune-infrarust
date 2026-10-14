@@ -1,0 +1,42 @@
+[package]
+name = "infrarust-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+description = "Plugin API for Infrarust, a Minecraft reverse proxy"
+keywords = ["minecraft", "proxy", "plugin", "api"]
+categories = ["game-development", "network-programming"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+infrarust-plugin-common = { workspace = true }
+ipnet = { workspace = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+proptest = "1.11.0"
+
+[features]
+default = []
+serde = ["dep:serde"]
+# Tier 3 virtual backends: the proxy does not dispatch to them yet.
+unstable = []
+# Proxy-only plumbing (`__private`) for infrarust-core and the WASM loader. Plugins must not enable it.
+host = []
+# Test-only helpers (e.g. a constructible LimboSession) for downstream crates.
+test-util = []

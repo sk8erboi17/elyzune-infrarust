@@ -1,0 +1,67 @@
+interface guest {
+    use types.{plugin-metadata, player-id, player-ref, handler-id, listener-handle, component};
+    use events.{event, event-outcome};
+    use limbo.{limbo-session, handler-result, session-end-reason};
+    use permissions.{permission-subject, permission-snapshot};
+    use ban-service.{
+        login-attempt, ban-verdict, ban-request, ban-source, ban-record, unban-request, ban-target,
+        ban-query, ban-record-page,
+    };
+
+    record recovery-info {
+        attempt: u32,
+        cause: string,
+    }
+
+    variant enable-reason {
+        initial,
+        recovered(recovery-info),
+    }
+
+    enum disable-reason {
+        shutdown,
+        unload,
+        quarantine,
+    }
+
+    variant command-sender {
+        console,
+        player(player-ref),
+    }
+
+    record command-invocation {
+        label: string,
+        args: list<string>,
+        raw: string,
+        sender: command-sender,
+    }
+
+    record suggestion {
+        text: string,
+        tooltip: option<component>,
+    }
+
+    metadata: func() -> plugin-metadata;
+    on-enable: func(reason: enable-reason) -> result<_, string>;
+    on-disable: func(reason: disable-reason) -> result<_, string>;
+
+    handle-event: func(listener: listener-handle, ev: event) -> event-outcome;
+
+    handle-command: func(handler: handler-id, invocation: command-invocation);
+    tab-complete: func(handler: handler-id, sender: command-sender, args: list<string>, cursor: u32) -> list<suggestion>;
+    on-scheduled-task: func(handler: handler-id);
+
+    limbo-on-player-enter: func(handler: handler-id, session: borrow<limbo-session>) -> handler-result;
+    limbo-on-command: func(handler: handler-id, session: borrow<limbo-session>, command: string, args: list<string>);
+    limbo-on-chat: func(handler: handler-id, session: borrow<limbo-session>, message: string);
+    limbo-on-disconnect: func(handler: handler-id, player: player-id);
+    limbo-on-session-end: func(handler: handler-id, player: player-id, reason: session-end-reason);
+
+    ban-provider-check: func(attempt: login-attempt) -> result<option<ban-verdict>, string>;
+    ban-provider-ban: func(request: ban-request, source: ban-source) -> result<ban-record, string>;
+    ban-provider-unban: func(request: unban-request) -> result<option<ban-record>, string>;
+    ban-provider-get: func(target: ban-target) -> result<option<ban-record>, string>;
+    ban-provider-list: func(query: ban-query) -> result<ban-record-page, string>;
+
+    permission-snapshot-for: func(subject: permission-subject) -> permission-snapshot;
+}

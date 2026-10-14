@@ -1,0 +1,47 @@
+interface codec-filter {
+    use types.{raw-packet, protocol-version, connection-state, handler-id, socket-address, ip-address};
+
+    enum connection-side { client-side, server-side }
+
+    record codec-session-init {
+        client-version: protocol-version,
+        connection-id: u64,
+        remote-addr: socket-address,
+        real-ip: option<ip-address>,
+        side: connection-side,
+    }
+
+    variant codec-filter-error {
+        translation-failed(string),
+        malformed-payload,
+        unsupported-version(s32),
+        internal(string),
+    }
+
+    record filter-extras {
+        packet: option<raw-packet>,
+        inject-before: list<raw-packet>,
+        inject-after: list<raw-packet>,
+    }
+
+    variant filter-output {
+        pass,
+        drop,
+        pass-modified(filter-extras),
+        replace(filter-extras),
+        error(codec-filter-error),
+    }
+
+    enum filter-verdict { pass, drop, modified }
+
+    resource filter-instance {
+        filter: func(packet-id: s32, data: list<u8>) -> filter-verdict;
+        take-output: func() -> filter-output;
+        on-state-change: func(new-state: connection-state);
+        on-compression-change: func(threshold: s32);
+        on-encryption-enabled: func();
+        on-close: func();
+    }
+
+    create: func(factory: handler-id, init: codec-session-init) -> filter-instance;
+}

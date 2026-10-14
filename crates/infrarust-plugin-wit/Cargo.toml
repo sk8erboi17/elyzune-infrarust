@@ -1,0 +1,21 @@
+[package]
+name = "infrarust-plugin-wit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+description = "Frozen WIT contract (infrarust:plugin) shared by the WASM host loader and the guest SDK"
+keywords = ["minecraft", "proxy", "plugin", "wasm", "wit"]
+categories = ["game-development", "wasm"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+infrarust-plugin-common = { workspace = true }
+wit-parser = { version = "0.259.0", default-features = false, features = ["std"] }

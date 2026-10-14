@@ -1,0 +1,225 @@
+use std::net::{IpAddr, SocketAddr};
+
+use crate::bindings::codec_filter::{CodecSessionInit as WitSessionInit, RawPacket};
+pub use crate::bindings::codec_filter::{ConnectionSide, ConnectionState};
+use crate::types::{ToWit, ip_from_wit, socket_from_wit};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodecSessionInit {
+    pub client_version: i32,
+    pub connection_id: u64,
+    pub remote_addr: SocketAddr,
+    pub real_ip: Option<IpAddr>,
+    pub side: ConnectionSide,
+}
+
+impl CodecSessionInit {
+    pub(crate) fn from_wit(init: WitSessionInit) -> Self {
+        Self {
+            client_version: init.client_version,
+            connection_id: init.connection_id,
+            remote_addr: socket_from_wit(init.remote_addr),
+            real_ip: init.real_ip.map(ip_from_wit),
+            side: init.side,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CodecContext {
+    pub client_version: i32,
+    pub state: ConnectionState,
+    pub connection_id: u64,
+    pub side: ConnectionSide,
+}
+
+impl CodecContext {
+    pub(crate) fn from_init(init: &CodecSessionInit) -> Self {
+        Self {
+            client_version: init.client_version,
+            state: ConnectionState::Handshake,
+            connection_id: init.connection_id,
+            side: init.side,
+        }
+    }
+}
+
+/// A framed Minecraft packet. Reads are free; any mutation marks the packet dirty
+/// so the host only re-copies it when it actually changed (`none` = zero-copy pass).
+pub struct Packet {
+    id: i32,
+    data: Vec<u8>,
+    dirty: bool,
+}
+
+impl Packet {
+    #[must_use]
+    pub fn new(id: i32, data: Vec<u8>) -> Self {
+        Self {
+            id,
+            data,
+            dirty: true,
+        }
+    }
+
+    #[must_use]
+    pub fn id(&self) -> i32 {
+        self.id
+    }
+
+    #[must_use]
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    pub fn set_id(&mut self, id: i32) {
+        self.id = id;
+        self.dirty = true;
+    }
+
+    pub fn set_data(&mut self, data: Vec<u8>) {
+        self.data = data;
+        self.dirty = true;
+    }
+
+    pub fn data_mut(&mut self) -> &mut Vec<u8> {
+        self.dirty = true;
+        &mut self.data
+    }
+
+    pub(crate) fn from_parts(id: i32, data: Vec<u8>) -> Self {
+        Self {
+            id,
+            data,
+            dirty: false,
+        }
+    }
+
+    fn into_wit(self) -> RawPacket {
+        RawPacket {
+            packet_id: self.id,
+            data: self.data,
+        }
+    }
+}
+
+pub enum Verdict {
+    Pass,
+    Drop,
+    Replace,
+}
+
+#[derive(Default)]
+pub struct Injections {
+    before: Vec<Packet>,
+    after: Vec<Packet>,
+}
+
+impl Injections {
+    pub fn before(&mut self, packet: Packet) {
+        self.before.push(packet);
+    }
+
+    pub fn after(&mut self, packet: Packet) {
+        self.after.push(packet);
+    }
+}
+
+pub use infrarust_plugin_common::enums::FilterPriority;
+
+pub trait CodecFilter {
+    /// Inspect/modify a single packet. Mutating `packet` is applied; push frames
+    /// into `out` to inject around it.
+    fn filter(&mut self, ctx: &CodecContext, packet: &mut Packet, out: &mut Injections) -> Verdict;
+
+    /// Protocol state changed (e.g. Login → Configuration → Play).
+    fn on_state_change(&mut self, _new_state: ConnectionState) {}
+    /// Compression was enabled or its threshold changed.
+    fn on_compression_change(&mut self, _threshold: i32) {}
+    /// Encryption was enabled.
+    fn on_encryption_enabled(&mut self) {}
+    /// The connection-side is closing.
+    fn on_close(&mut self) {}
+}
+
+/// Constructor for a per-connection [`CodecFilter`].
+pub type FilterConstructor = Box<dyn Fn(&CodecSessionInit) -> Box<dyn CodecFilter>>;
+
+/// Collects a plugin's codec-filter declarations. Passed to
+/// [`Plugin::register_codec_filters`](crate::Plugin::register_codec_filters); the
+/// macro replays that method on the main instance (to register with the host) and
+/// on each fresh codec instance (to rebuild the constructor table).
+pub struct CodecRegistrar {
+    pub(crate) notify: bool,
+}
+
+impl CodecRegistrar {
+    /// Registers a codec filter under `id` with the given ordering `priority`.
+    pub fn add(
+        &mut self,
+        id: &str,
+        priority: FilterPriority,
+        constructor: impl Fn(&CodecSessionInit) -> Box<dyn CodecFilter> + 'static,
+    ) {
+        self.register(id, priority, false, Box::new(constructor));
+    }
+
+    pub fn add_required(
+        &mut self,
+        id: &str,
+        priority: FilterPriority,
+        constructor: impl Fn(&CodecSessionInit) -> Box<dyn CodecFilter> + 'static,
+    ) {
+        self.register(id, priority, true, Box::new(constructor));
+    }
+
+    fn register(
+        &mut self,
+        id: &str,
+        priority: FilterPriority,
+        required: bool,
+        constructor: FilterConstructor,
+    ) {
+        let metadata = crate::bindings::codec_registry::CodecFilterMetadata {
+            id: id.to_string(),
+            priority: priority.to_wit(),
+            after: Vec::new(),
+            before: Vec::new(),
+            required,
+        };
+        crate::runtime::register_codec_factory(self.notify, metadata, constructor);
+    }
+}
+
+/// Builds a guest `filter-output` from a user verdict + the (possibly mutated)
+/// packet + injections. A `Pass` with an unmodified packet sends `none`
+/// (zero-copy) so the host doesn't re-copy unchanged bytes.
+pub(crate) fn build_filter_output(
+    verdict: Verdict,
+    packet: Packet,
+    injections: Injections,
+) -> crate::bindings::codec_filter::FilterOutput {
+    use crate::bindings::codec_filter::{FilterExtras, FilterOutput};
+    let before: Vec<_> = injections
+        .before
+        .into_iter()
+        .map(Packet::into_wit)
+        .collect();
+    let after: Vec<_> = injections.after.into_iter().map(Packet::into_wit).collect();
+    match verdict {
+        Verdict::Pass if !packet.dirty && before.is_empty() && after.is_empty() => {
+            FilterOutput::Pass
+        }
+        Verdict::Pass => FilterOutput::PassModified(FilterExtras {
+            packet: packet.dirty.then(|| packet.into_wit()),
+            inject_before: before,
+            inject_after: after,
+        }),
+        Verdict::Drop => FilterOutput::Drop,
+        Verdict::Replace => FilterOutput::Replace(FilterExtras {
+            packet: None,
+            inject_before: before,
+            inject_after: after,
+        }),
+    }
+}

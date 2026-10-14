@@ -1,0 +1,39 @@
+# The texts Elyzune's public entry shows players: Infrarust's kick reasons
+# and refusals (infrarust-core/src/texts.rs, keys at the top of each table)
+# and elyzune-identity's ([<language>.identity]).
+#
+# Where the live Velocity had the same situation, the text is Velocity's own
+# (its lang/messages.properties and messages_it_IT.properties of the
+# deployed proxy, 16 September 2026), so players read what they read before
+# the cutover; the identity texts are new, as the hybrid login is. One
+# language for everyone, [messages] language in infrarust.toml: these are
+# shown before a client says which language it reads, which is why Velocity
+# showed them in its own locale (English) too.
+
+[en]
+shutdown = "Proxy shutting down."
+replaced = "You logged in from another location"
+unreachable = "There are no available servers to connect you to. Try again later or contact an admin."
+rate-limited = "You are logging in too fast, try again later."
+internal-error = "An internal error occurred in your connection."
+authentication-unavailable = "Authentication is unavailable right now. Try again in a moment."
+
+[en.identity]
+paid-name = "&x&F&0&E&8&D&8This name belongs to a Minecraft account: join with that account from the official launcher."
+unavailable = "&x&F&0&E&8&D&8Your name cannot be checked right now. Try again in a moment."
+already-connected = "You are already connected to this proxy!"
+invalid-name = "&x&F&0&E&8&D&8This name is not valid."
+
+[it]
+shutdown = "Il server è in fase di arresto."
+replaced = "Hai effettuato l'accesso da un'altra posizione"
+unreachable = "Non ci sono server disponibili per connetterti. Riprova più tardi o contatta un amministratore."
+rate-limited = "Stai accedendo troppo velocemente, riprova più tardi."
+internal-error = "Si è verificato un errore interno nella connessione."
+authentication-unavailable = "L'autenticazione non è disponibile in questo momento. Riprova tra poco."
+
+[it.identity]
+paid-name = "&x&F&0&E&8&D&8Questo nome appartiene a un account Minecraft: entra con quell'account dal launcher ufficiale."
+unavailable = "&x&F&0&E&8&D&8Non è possibile verificare il tuo nome in questo momento. Riprova tra poco."
+already-connected = "Sei già connesso a questo proxy!"
+invalid-name = "&x&F&0&E&8&D&8Questo nome non è valido."

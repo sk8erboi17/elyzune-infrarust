@@ -1,0 +1,29 @@
+//! Filter metadata and priority types for ordering.
+
+/// Metadata describing a filter, used for ordering within a chain.
+#[derive(Debug, Clone)]
+pub struct FilterMetadata {
+    /// Unique identifier for this filter.
+    pub id: String,
+    /// Base priority for ordering.
+    pub priority: FilterPriority,
+    /// This filter must execute AFTER these filters (by id).
+    pub after: Vec<String>,
+    /// This filter must execute BEFORE these filters (by id).
+    pub before: Vec<String>,
+}
+
+pub use infrarust_plugin_common::enums::FilterPriority;
+
+impl FilterMetadata {
+    /// Creates metadata with only an id and default priority.
+    #[must_use]
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            priority: FilterPriority::Normal,
+            after: Vec::new(),
+            before: Vec::new(),
+        }
+    }
+}

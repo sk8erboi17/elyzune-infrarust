@@ -1,0 +1,24 @@
+[package]
+name = "infrarust-plugin-sdk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+description = "Guest SDK for authoring Infrarust WASM plugins (infrarust:plugin@0.3.0)"
+keywords = ["minecraft", "proxy", "plugin", "wasm", "wit"]
+categories = ["game-development", "wasm"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
+
+[dependencies]
+wit-bindgen = { workspace = true }
+infrarust-plugin-macros = { workspace = true }
+infrarust-plugin-wit = { workspace = true }
+infrarust-plugin-common = { workspace = true }
+uuid = { version = "1.26.1", default-features = false }

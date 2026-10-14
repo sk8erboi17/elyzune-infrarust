@@ -1,0 +1,244 @@
+//! Client-side bridge for intercepted proxy modes.
+//!
+//! Wraps the client TCP stream with packet codec, optional encryption
+//! (AES-128-CFB8), and optional compression. Survives backend death
+//! to support future server switch / limbo.
+
+use bytes::BytesMut;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+
+use infrarust_api::types::Component;
+use infrarust_protocol::Packet;
+use infrarust_protocol::codec::McBufWriteExt;
+use infrarust_protocol::crypto::{DecryptCipher, EncryptCipher};
+use infrarust_protocol::io::{PacketDecoder, PacketEncoder, PacketFrame};
+use infrarust_protocol::packets::config::CConfigDisconnect;
+use infrarust_protocol::packets::login::CLoginDisconnect;
+use infrarust_protocol::packets::play::disconnect::CDisconnect;
+use infrarust_protocol::registry::PacketRegistry;
+use infrarust_protocol::version::{ConnectionState, ProtocolVersion};
+
+use crate::error::CoreError;
+use crate::player::packets::encode_for_state;
+use crate::util::text;
+
+const READ_CHUNK: usize = 16 * 1024;
+
+/// The client side of a proxied connection.
+///
+/// Handles reading/writing Minecraft packet frames from/to the client,
+/// with optional encryption and compression.
+pub struct ClientBridge {
+    stream: TcpStream,
+    decoder: PacketDecoder,
+    encoder: PacketEncoder,
+    encrypt_cipher: Option<EncryptCipher>,
+    decrypt_cipher: Option<DecryptCipher>,
+    /// The client's protocol version.
+    pub protocol_version: ProtocolVersion,
+    state: ConnectionState,
+    awaiting_config_ack: bool,
+}
+
+impl ClientBridge {
+    /// `buffered_data` contains bytes already read by the pipeline middlewares
+    /// (handshake, login start). These are fed to the decoder first.
+    #[allow(clippy::needless_pass_by_value)] // BytesMut is logically consumed here
+    pub fn new(
+        stream: TcpStream,
+        buffered_data: BytesMut,
+        protocol_version: ProtocolVersion,
+    ) -> Self {
+        let mut decoder = PacketDecoder::new();
+        if !buffered_data.is_empty() {
+            decoder.queue_bytes(&buffered_data);
+        }
+
+        Self {
+            stream,
+            decoder,
+            encoder: PacketEncoder::new(),
+            encrypt_cipher: None,
+            decrypt_cipher: None,
+            protocol_version,
+            state: ConnectionState::Login,
+            awaiting_config_ack: false,
+        }
+    }
+
+    /// Reads the next packet frame from the client.
+    ///
+    /// Returns `Ok(None)` on clean disconnect (EOF).
+    /// Handles decryption if encryption is active.
+    ///
+    /// # Errors
+    /// Returns `CoreError` on I/O or protocol decode errors.
+    pub async fn read_frame(&mut self) -> Result<Option<PacketFrame>, CoreError> {
+        loop {
+            if let Some(frame) = self.decoder.try_next_frame()? {
+                return Ok(Some(frame));
+            }
+
+            let buf = self.decoder.read_buf_mut();
+            buf.reserve(READ_CHUNK);
+            let old_len = buf.len();
+            let n = self.stream.read_buf(buf).await?;
+            if n == 0 {
+                return Ok(None);
+            }
+
+            if let Some(cipher) = &mut self.decrypt_cipher {
+                cipher.decrypt(&mut self.decoder.read_buf_mut()[old_len..]);
+            }
+        }
+    }
+
+    /// Extracts the next frame already buffered in the decoder, without
+    /// reading from the socket. Used to drain a read that carried several
+    /// frames before flushing them as one write.
+    ///
+    /// # Errors
+    /// Returns `CoreError` on protocol decode errors.
+    pub fn try_next_frame(&mut self) -> Result<Option<PacketFrame>, CoreError> {
+        Ok(self.decoder.try_next_frame()?)
+    }
+
+    /// Encodes a frame into the send buffer without writing to the socket.
+    /// Queued bytes go out on the next [`flush`](Self::flush) or
+    /// [`write_frame`](Self::write_frame).
+    ///
+    /// # Errors
+    /// Returns `CoreError` on encoding errors.
+    pub fn queue_frame(&mut self, frame: &PacketFrame) -> Result<(), CoreError> {
+        Ok(self.encoder.append_frame(frame)?)
+    }
+
+    /// Writes all queued bytes to the socket, encrypting once over the
+    /// whole batch. No-op when nothing is queued.
+    ///
+    /// # Errors
+    /// Returns `CoreError` on I/O errors.
+    pub async fn flush(&mut self) -> Result<(), CoreError> {
+        let mut data = self.encoder.take();
+        if data.is_empty() {
+            return Ok(());
+        }
+        if let Some(cipher) = &mut self.encrypt_cipher {
+            cipher.encrypt(&mut data);
+        }
+        self.stream.write_all(&data).await?;
+        Ok(())
+    }
+
+    /// Writes an encoded packet frame to the client (with any queued bytes).
+    ///
+    /// # Errors
+    /// Returns `CoreError` on I/O or encoding errors.
+    pub async fn write_frame(&mut self, frame: &PacketFrame) -> Result<(), CoreError> {
+        self.queue_frame(frame)?;
+        self.flush().await
+    }
+
+    /// Enables AES-128-CFB8 encryption with the given shared secret.
+    ///
+    /// In Minecraft, the IV equals the key. Both encrypt and decrypt
+    /// ciphers are created from the same 16-byte key.
+    pub fn enable_encryption(&mut self, key: &[u8; 16]) {
+        self.encrypt_cipher = Some(EncryptCipher::new(key));
+        self.decrypt_cipher = Some(DecryptCipher::new(key));
+    }
+
+    /// Activates packet compression with the given threshold, or leaves it
+    /// disabled if `threshold` is negative.
+    pub const fn set_compression(&mut self, threshold: i32) {
+        self.decoder.set_compression(threshold);
+        self.encoder.set_compression(threshold);
+    }
+
+    pub const fn compression_threshold(&self) -> Option<i32> {
+        self.encoder.compression_threshold()
+    }
+
+    /// Changes the protocol state (Login → Config → Play).
+    pub const fn set_state(&mut self, state: ConnectionState) {
+        self.state = state;
+    }
+
+    pub const fn state(&self) -> ConnectionState {
+        self.state
+    }
+
+    pub const fn begin_reconfiguration(&mut self) {
+        self.state = ConnectionState::Config;
+        self.awaiting_config_ack = true;
+    }
+
+    pub const fn reconfiguration_acknowledged(&mut self) {
+        self.awaiting_config_ack = false;
+    }
+
+    pub const fn awaits_config_ack(&self) -> bool {
+        self.awaiting_config_ack
+    }
+
+    pub async fn send_packet<P: Packet>(
+        &mut self,
+        packet: &P,
+        registry: &PacketRegistry,
+    ) -> Result<(), CoreError> {
+        let frame = encode_for_state(packet, self.state, self.protocol_version, registry)?;
+        self.write_frame(&frame).await
+    }
+
+    pub async fn close_with(&mut self, frame: &PacketFrame) -> Result<(), CoreError> {
+        let written = self.write_frame(frame).await;
+        self.stream.shutdown().await.ok();
+        written
+    }
+
+    /// Sends a disconnect packet and shuts down the connection.
+    ///
+    /// Uses the correct packet type and encoding for the current state and version:
+    /// - Login: `CLoginDisconnect` (JSON string)
+    /// - Config: `CConfigDisconnect` (JSON for 1.20.2, NBT for 1.20.3+)
+    /// - Play: `CDisconnect` (JSON for <1.20.3, NBT for 1.20.3+)
+    ///
+    /// # Errors
+    /// Returns `CoreError` on encoding or I/O errors.
+    pub async fn disconnect(
+        &mut self,
+        reason: &Component,
+        registry: &PacketRegistry,
+    ) -> Result<(), CoreError> {
+        let version = self.protocol_version;
+        match self.state {
+            ConnectionState::Login => {
+                let pkt = CLoginDisconnect {
+                    reason: text::json_for(reason, version),
+                };
+                self.send_packet(&pkt, registry).await.ok();
+            }
+            ConnectionState::Config => {
+                let reason = if text::uses_nbt(version, ConnectionState::Config) {
+                    text::nbt_for(reason, version)
+                } else {
+                    let mut buf = Vec::new();
+                    buf.write_string(&text::json_for(reason, version))?;
+                    buf
+                };
+                let pkt = CConfigDisconnect { reason };
+                self.send_packet(&pkt, registry).await.ok();
+            }
+            ConnectionState::Play => {
+                let pkt = CDisconnect {
+                    reason: text::encode_text_component(reason, version, ConnectionState::Play),
+                };
+                self.send_packet(&pkt, registry).await.ok();
+            }
+            _ => {}
+        }
+        self.stream.shutdown().await.ok();
+        Ok(())
+    }
+}

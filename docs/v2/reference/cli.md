@@ -1,0 +1,312 @@
+---
+title: CLI Reference
+description: All commands, flags, and options for the Infrarust binary and bundled tools.
+outline: [2, 3]
+---
+
+# CLI Reference
+
+## infrarust
+
+The main proxy binary. It loads a TOML configuration file, starts the proxy, and opens an interactive console.
+
+```bash
+infrarust [OPTIONS]
+```
+
+### Options
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--config <PATH>` | `-c` | `infrarust.toml` | Path to the proxy configuration file |
+| `--bind <ADDR>` | `-b` | *(from config)* | Override the bind address (e.g. `0.0.0.0:25577`) |
+| `--log-level <LEVEL>` | `-l` | `info` | Log level filter. Overridden by the `RUST_LOG` env var |
+| `--plugins-dir <PATH>` | | *(from config)* | Override the plugins directory path |
+| `--servers-dir <PATH>` | | *(from config)* | Override the servers directory path |
+| `--version` | `-V` | | Print version |
+| `--help` | `-h` | | Print help |
+
+### Examples
+
+Start with the default config file in the current directory:
+
+```bash
+infrarust
+```
+
+Point to a specific config file and override the bind address:
+
+```bash
+infrarust -c /etc/infrarust/proxy.toml --bind 0.0.0.0:25577
+```
+
+Enable debug logging:
+
+```bash
+infrarust --log-level debug
+```
+
+Use the `RUST_LOG` environment variable for fine-grained control (this takes priority over `--log-level`):
+
+```bash
+RUST_LOG=infrarust=trace,infrarust_core=debug infrarust
+```
+
+### Features
+
+The binary supports an optional compile-time feature:
+
+| Feature | Description |
+|---------|-------------|
+| `telemetry` | Enables OpenTelemetry tracing export. Configured in the `[telemetry]` section of the config file. |
+
+Build with telemetry support:
+
+```bash
+cargo build --release --features telemetry
+```
+
+### Interactive console
+
+Once running, Infrarust drops you into an interactive console. Type `help` to see all commands. The full list is below, grouped by category.
+
+Replies that span several lines open with a `◆ Title` header and keep a `│` rail down the left edge, so they stay easy to tell apart from the log lines printed around them. Tables are plain aligned columns; on a narrow terminal the last column is cut with `…`. One-line replies start with `✓` (done), `!` (warning) or `✗` (error). A command typed with missing arguments prints its usage, and a mistyped command name suggests the closest one.
+
+Without colors (see [Colors](#colors)) the same replies use ASCII markers: `#` for the header, `|` for the rail, and `ok:`, `warn:` or `error:` in front of one-line replies, which keeps `docker logs` output easy to grep.
+
+#### Players
+
+| Command | Aliases | Usage | Description |
+|---------|---------|-------|-------------|
+| `list` | `players`, `who`, `online`, `ls` | `list [server]` | List connected players |
+| `find` | | `find <player>` | Find a player by name |
+| `kick` | | `kick <player> [reason...]` | Kick a player |
+| `kick-ip` | `kickip` | `kick-ip <ip>` | Kick all players from an IP |
+| `send` | | `send <player> <server>` | Transfer a player to a server |
+| `send-all` | `sendall` | `send-all <server>` | Transfer all players to a server |
+| `msg` | `tell`, `whisper` | `msg <player> <message...>` | Send a message to a player |
+| `broadcast` | `bc`, `say` | `broadcast <message...>` | Broadcast to all players |
+| `op` | | `op <username>` | Grant admin to a player (effective until restart unless persisted in config) |
+| `deop` | | `deop <username>` | Revoke admin from a player |
+| `ops` | `oplist` | `ops` | List current admins |
+
+#### Bans
+
+| Command | Aliases | Usage | Description |
+|---------|---------|-------|-------------|
+| `ban` | | `ban <player> [duration] [reason...]` | Ban a player by username |
+| `ban-ip` | `banip` | `ban-ip <ip> [duration] [reason...]` | Ban an IP address |
+| `unban` | `pardon` | `unban <player>` | Unban a player |
+| `unban-ip` | `unbanip`, `pardonip` | `unban-ip <ip>` | Unban an IP address |
+| `banlist` | `bans` | `banlist` | List all active bans |
+| `baninfo` | | `baninfo <player\|ip\|uuid>` | Show ban details |
+
+#### Servers
+
+| Command | Aliases | Usage | Description |
+|---------|---------|-------|-------------|
+| `servers` | `backends` | `servers` | List all servers |
+| `server` | | `server <id>` | Show server details |
+| `start` | | `start <server_id>` | Start a server |
+| `stop-server` | `stopserver` | `stop-server <server_id>` | Stop a server |
+
+#### Configuration
+
+| Command | Aliases | Usage | Description |
+|---------|---------|-------|-------------|
+| `reload` | | `reload` | Reload configuration |
+| `config` | | `config [key]` | List the servers, or print one value of the running configuration by its dotted path, such as `keepalive.retries` (secrets redacted) |
+
+#### Plugins
+
+| Command | Aliases | Usage | Description |
+|---------|---------|-------|-------------|
+| `plugins` | `pl` | `plugins` | List loaded plugins with their state; WASM plugins also get their health and queue wait |
+| `plugin` | | `plugin <id>` | Show plugin details, and for a WASM plugin its health, generation, restarts, last fault and call queue |
+
+When at least one WASM plugin is loaded, `plugins` adds two columns. `Health` is `healthy`, `recovering`, `quarantined` or `stopped`, followed by the time until the next attempt when one is scheduled (`quarantined 12s`). `Wait p99` is the queue wait that 99 % of the plugin's calls stayed under over the last minute. Native plugins show `-` in both.
+
+For a WASM plugin, `plugin <id>` adds these lines:
+
+```
+│ health        ✕ quarantined, next attempt in 12s
+│ generation    7
+│ restarts      2 of 2 in the last 5m
+│ last fault    the guest trapped: panicked at src/lib.rs:12:5: boom (4s ago, generation 7)
+│ queue         0 of 1024 waiting, at most 12 in the last 1m
+│ queue wait    p50 21µs, p99 1.2ms, max 3.4s over 1234 calls in the last 1m
+```
+
+A quarantined or recovering plugin keeps the state `enabled`. [Fault Model](../plugins/wasm/fault-model#watching-a-plugin-s-health) explains the health values and [Threading](../plugins/wasm/threading#watching-the-queue) the queue figures.
+
+#### System
+
+| Command | Aliases | Usage | Description |
+|---------|---------|-------|-------------|
+| `help` | `?` | `help [command]` | Show help |
+| `version` | `ver` | `version` | Show version info |
+| `status` | `info` | `status` | Proxy overview |
+| `stop` | `shutdown`, `exit`, `quit` | `stop` | Shut down the proxy |
+| `clear` | `cls` | `clear` | Clear the screen |
+| `gc` | | `gc` | Run garbage collection |
+
+#### Plugin commands
+
+A line that is not one of the console commands above runs as a proxy command: a plugin command by its name, an alias, or its `<plugin_id>:<name>` form, or the built-in `ir` command. A leading `/` is ignored. The console holds every permission, and plugin replies appear as log lines under the `infrarust::console` target. When a plugin command shares a name with a console command, use the `<plugin_id>:<name>` form. `help` lists the plugin commands at the end.
+
+---
+
+## infrarust migrate
+
+Migrates V1 proxy configs (YAML) to the V2 format (TOML). Run it once when upgrading from V1.
+
+```bash
+infrarust migrate <INPUT> [OPTIONS]
+```
+
+`INPUT` is the directory containing V1 server YAML files.
+
+### Options
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--output <DIR>` | `-o` | `./servers` | Directory where converted TOML files are written |
+| `--config <PATH>` | | | Path to a V1 global `config.yaml` to migrate alongside server configs |
+
+### Examples
+
+Migrate server configs only:
+
+```bash
+infrarust migrate ./old-servers
+```
+
+Migrate server configs and the global config at the same time:
+
+```bash
+infrarust migrate ./old-servers --output ./servers --config ./old-config.yaml
+```
+
+The command prints a summary of converted files, along with any warnings or errors encountered during migration. It exits with a non-zero code if any conversion fails.
+
+---
+
+## registry-extractor
+
+Connects to a vanilla Minecraft server and captures registry data for use in Infrarust's limbo system. Outputs both a binary file (`v<protocol>.bin`) and a debug JSON file.
+
+```bash
+registry-extractor [OPTIONS] --server <ADDRESS>
+```
+
+### Options
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--server <ADDRESS>` | `-s` | *(required)* | Server address to connect to |
+| `--output <DIR>` | `-o` | `crates/infrarust-core/registry` | Output directory for registry files |
+| `--protocol-version <INT>` | `-p` | *(auto-detect)* | Protocol version to use |
+| `--username <NAME>` | `-u` | `RegExtractor` | Username for the connection |
+
+### Examples
+
+Extract registry data from a local server:
+
+```bash
+registry-extractor --server localhost:25565
+```
+
+Target a specific protocol version and output directory:
+
+```bash
+registry-extractor -s mc.example.com -p 767 -o ./registries
+```
+
+---
+
+## infrarust-stress-test
+
+Stress test tool that floods an Infrarust (or any Minecraft) server with connections. Has three subcommands for different test modes.
+
+```bash
+infrarust-stress-test <COMMAND>
+```
+
+### Subcommands
+
+#### flood
+
+Sends rapid Server List Ping (SLP) requests.
+
+```bash
+infrarust-stress-test flood [OPTIONS]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--host <HOST>` | `127.0.0.1` | Target host |
+| `--port <PORT>` | `25565` | Target port |
+| `--concurrency <N>` | `200` | Number of concurrent workers |
+| `--duration <SECS>` | `300` | Test duration in seconds |
+
+#### malformed
+
+Sends various malformed packets to test protocol handling. Distributes workers evenly across six attack types: huge hostname, bogus VarInt length, random bytes, early close, random-after-handshake, and slowloris.
+
+```bash
+infrarust-stress-test malformed [OPTIONS]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--host <HOST>` | `127.0.0.1` | Target host |
+| `--port <PORT>` | `25565` | Target port |
+| `--concurrency <N>` | `50` | Number of concurrent workers |
+| `--duration <SECS>` | `300` | Test duration in seconds |
+
+#### mixed
+
+Runs 70% flood workers and 30% malformed workers simultaneously.
+
+```bash
+infrarust-stress-test mixed [OPTIONS]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--host <HOST>` | `127.0.0.1` | Target host |
+| `--port <PORT>` | `25565` | Target port |
+| `--concurrency <N>` | `200` | Number of concurrent workers |
+| `--duration <SECS>` | `300` | Test duration in seconds |
+
+### Example
+
+Run a 60-second SLP flood with 500 concurrent connections:
+
+```bash
+infrarust-stress-test flood --host proxy.example.com --port 25577 --concurrency 500 --duration 60
+```
+
+The tool prints live stats every 5 seconds (successes, errors, connection failures, average latency) and a final summary with p99 latency and throughput.
+
+---
+
+## Environment variables
+
+| Variable | Description |
+|----------|-------------|
+| `RUST_LOG` | Overrides `--log-level`. Accepts [tracing directives](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) like `infrarust=debug,infrarust_core=trace`. |
+| `INFRARUST_COLOR` | `auto` (default), `always` or `never`. Takes priority over the variables below. See [Colors](#colors). |
+| `NO_COLOR` | Any non-empty value turns colors off. |
+| `FORCE_COLOR`, `CLICOLOR_FORCE` | Any value other than `0` turns colors on, even without a terminal. |
+| `COLORTERM` | `truecolor` or `24bit` enables 24-bit colors when colors are forced; otherwise the 256-color palette is used. |
+
+### Colors
+
+In `auto` mode Infrarust colors the console, the logs and the startup banner only when standard output is a terminal. Game panels such as Pterodactyl or Pelican display colors without giving the process a terminal, so set `INFRARUST_COLOR=always` there. Set `INFRARUST_COLOR=never` to keep plain ASCII output, for example when logs go to a file.
+
+When standard output is a terminal, log lines use a short local time, and fields that do not fit on the line wrap below the message. Otherwise each event stays on a single line with a full UTC timestamp, in `key=value` form:
+
+```
+2026-09-27T14:02:11Z INFO  player joined  player=Notch server=lobby span=session>login
+```

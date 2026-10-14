@@ -1,0 +1,106 @@
+[package]
+name = "infrarust-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+description = "Core library for Infrarust, a Minecraft proxy server written in Rust. Provides shared utilities, types, and traits for the Infrarust ecosystem."
+readme = "README.md"
+keywords = ["minecraft", "proxy", "server", "networking"]
+categories = ["game-development", "network-programming"]
+
+[package.metadata.docs.rs]
+features = ["docker", "telemetry"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
+
+[features]
+default = []
+docker = ["dep:bollard"]
+libdeflater = ["infrarust_protocol/libdeflater"]
+# Per-filter / per-packet hot-path timing, emitted on the `infrarust::bench_timing`
+# tracing target. Off by default — compiles out entirely in normal builds.
+bench-timing = ["dep:quanta"]
+telemetry = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+]
+test-support = ["infrarust-api/test-util"]
+
+[dependencies]
+infrarust-api = { workspace = true, features = ["serde", "host"] }
+infrarust-plugin-common = { workspace = true }
+infrarust_config = { workspace = true }
+infrarust_protocol = { workspace = true }
+infrarust-transport = { workspace = true }
+infrarust_server_manager = { workspace = true }
+
+tokio = { workspace = true, features = ["fs", "rt-multi-thread"] }
+tokio-util = { workspace = true, features = ["rt"] }
+futures-util = { workspace = true }
+bytes = { workspace = true }
+dashmap = { workspace = true }
+governor = { workspace = true }
+smallvec = { workspace = true }
+notify = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+toml_edit = { workspace = true }
+reqwest = { workspace = true }
+wildmatch = { workspace = true }
+console = { workspace = true }
+chrono = { workspace = true }
+humantime = { workspace = true }
+flate2 = { workspace = true }
+
+# Hot-path timing (optional, `bench-timing` feature)
+quanta = { workspace = true, optional = true }
+
+# Docker provider (optional)
+bollard = { workspace = true, optional = true }
+
+# Telemetry (optional)
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+
+# Auth Mojang (ClientOnly)
+rsa = { workspace = true }
+md-5 = { workspace = true }
+sha1 = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+rand = { workspace = true }
+num-bigint = { workspace = true }
+base64 = { workspace = true }
+
+[build-dependencies]
+flate2 = { workspace = true }
+
+[dev-dependencies]
+infrarust-core = { path = ".", features = ["test-support"] }
+infrarust-api = { workspace = true, features = ["serde", "test-util"] }
+tokio = { workspace = true, features = ["full", "test-util"] }
+tempfile = { workspace = true }
+divan = { workspace = true }
+
+[[bench]]
+name = "codec_chain"
+harness = false
+
+[[bench]]
+name = "intercepted_pipeline"
+harness = false
+
+[[bench]]
+name = "event_dispatch"
+harness = false

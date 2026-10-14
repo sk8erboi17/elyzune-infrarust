@@ -1,0 +1,218 @@
+#[allow(clippy::crate_in_macro_def)]
+#[macro_export]
+macro_rules! raw_fixture {
+    (
+        $comp:ident,
+        id: $id:literal,
+        name: $name:literal,
+        description: $desc:expr,
+        on_enable: $on_enable:block $(,)?
+    ) => {
+        $crate::raw_fixture!(
+            $comp,
+            id: $id,
+            name: $name,
+            description: $desc,
+            on_enable: $on_enable,
+            handle_event: |_listener: u64, _ev: crate::exports::infrarust::plugin::guest::Event| {
+                crate::exports::infrarust::plugin::guest::EventOutcome::Unchanged
+            },
+        );
+    };
+    (
+        $comp:ident,
+        id: $id:literal,
+        name: $name:literal,
+        description: $desc:expr,
+        on_enable: $on_enable:block,
+        handle_event: $handle:expr $(,)?
+    ) => {
+        $crate::raw_fixture_with_metadata!(
+            $comp,
+            metadata: {
+                crate::exports::infrarust::plugin::guest::PluginMetadata {
+                    id: ::std::string::String::from($id),
+                    name: ::std::string::String::from($name),
+                    version: ::std::string::String::from("0.1.0"),
+                    authors: ::std::vec::Vec::new(),
+                    description: $desc,
+                    dependencies: ::std::vec::Vec::new(),
+                }
+            },
+            on_enable: $on_enable,
+            handle_event: $handle,
+        );
+    };
+}
+
+#[allow(clippy::crate_in_macro_def)]
+#[macro_export]
+macro_rules! raw_fixture_with_metadata {
+    (
+        $comp:ident,
+        metadata: $metadata:block,
+        on_enable: $on_enable:block $(,)?
+    ) => {
+        $crate::raw_fixture_with_metadata!(
+            $comp,
+            metadata: $metadata,
+            on_enable: $on_enable,
+            handle_event: |_listener: u64, _ev: crate::exports::infrarust::plugin::guest::Event| {
+                crate::exports::infrarust::plugin::guest::EventOutcome::Unchanged
+            },
+        );
+    };
+    (
+        $comp:ident,
+        metadata: $metadata:block,
+        on_enable: $on_enable:block,
+        handle_event: $handle:expr $(,)?
+    ) => {
+        impl crate::exports::infrarust::plugin::guest::Guest for $comp {
+            fn metadata() -> crate::exports::infrarust::plugin::guest::PluginMetadata $metadata
+            fn on_enable(
+                _reason: crate::exports::infrarust::plugin::guest::EnableReason,
+            ) -> ::core::result::Result<(), ::std::string::String> $on_enable
+            fn on_disable(
+                _reason: crate::exports::infrarust::plugin::guest::DisableReason,
+            ) -> ::core::result::Result<(), ::std::string::String> {
+                ::core::result::Result::Ok(())
+            }
+            fn handle_event(
+                listener: u64,
+                ev: crate::exports::infrarust::plugin::guest::Event,
+            ) -> crate::exports::infrarust::plugin::guest::EventOutcome {
+                ($handle)(listener, ev)
+            }
+            fn handle_command(
+                _handler: u64,
+                _invocation: crate::exports::infrarust::plugin::guest::CommandInvocation,
+            ) {
+            }
+            fn tab_complete(
+                _handler: u64,
+                _sender: crate::exports::infrarust::plugin::guest::CommandSender,
+                _args: ::std::vec::Vec<::std::string::String>,
+                _cursor: u32,
+            ) -> ::std::vec::Vec<crate::exports::infrarust::plugin::guest::Suggestion> {
+                ::std::vec::Vec::new()
+            }
+            fn on_scheduled_task(_handler: u64) {}
+            fn limbo_on_player_enter(
+                _handler: u64,
+                _session: &crate::exports::infrarust::plugin::guest::LimboSession,
+            ) -> crate::exports::infrarust::plugin::guest::HandlerResult {
+                crate::exports::infrarust::plugin::guest::HandlerResult::Accept
+            }
+            fn limbo_on_command(
+                _handler: u64,
+                _session: &crate::exports::infrarust::plugin::guest::LimboSession,
+                _command: ::std::string::String,
+                _args: ::std::vec::Vec<::std::string::String>,
+            ) {
+            }
+            fn limbo_on_chat(
+                _handler: u64,
+                _session: &crate::exports::infrarust::plugin::guest::LimboSession,
+                _message: ::std::string::String,
+            ) {
+            }
+            fn limbo_on_disconnect(_handler: u64, _player: u64) {}
+            fn limbo_on_session_end(
+                _handler: u64,
+                _player: u64,
+                _reason: crate::exports::infrarust::plugin::guest::SessionEndReason,
+            ) {
+            }
+            fn ban_provider_check(
+                _attempt: crate::infrarust::plugin::ban_service::LoginAttempt,
+            ) -> ::core::result::Result<
+                ::core::option::Option<crate::infrarust::plugin::ban_service::BanVerdict>,
+                ::std::string::String,
+            > {
+                ::core::result::Result::Err(::std::string::String::from("no ban provider"))
+            }
+            fn ban_provider_ban(
+                _request: crate::infrarust::plugin::ban_service::BanRequest,
+                _source: crate::infrarust::plugin::ban_service::BanSource,
+            ) -> ::core::result::Result<
+                crate::infrarust::plugin::ban_service::BanRecord,
+                ::std::string::String,
+            > {
+                ::core::result::Result::Err(::std::string::String::from("no ban provider"))
+            }
+            fn ban_provider_unban(
+                _request: crate::infrarust::plugin::ban_service::UnbanRequest,
+            ) -> ::core::result::Result<
+                ::core::option::Option<crate::infrarust::plugin::ban_service::BanRecord>,
+                ::std::string::String,
+            > {
+                ::core::result::Result::Err(::std::string::String::from("no ban provider"))
+            }
+            fn ban_provider_get(
+                _target: crate::infrarust::plugin::ban_service::BanTarget,
+            ) -> ::core::result::Result<
+                ::core::option::Option<crate::infrarust::plugin::ban_service::BanRecord>,
+                ::std::string::String,
+            > {
+                ::core::result::Result::Err(::std::string::String::from("no ban provider"))
+            }
+            fn ban_provider_list(
+                _query: crate::infrarust::plugin::ban_service::BanQuery,
+            ) -> ::core::result::Result<
+                crate::infrarust::plugin::ban_service::BanRecordPage,
+                ::std::string::String,
+            > {
+                ::core::result::Result::Err(::std::string::String::from("no ban provider"))
+            }
+            fn permission_snapshot_for(
+                _subject: crate::infrarust::plugin::permissions::PermissionSubject,
+            ) -> crate::infrarust::plugin::permissions::PermissionSnapshot {
+                crate::infrarust::plugin::permissions::PermissionSnapshot {
+                    rules: ::std::vec::Vec::new(),
+                    admin: false,
+                }
+            }
+        }
+
+        #[doc(hidden)]
+        struct __RawFixtureNoopFilter;
+
+        impl crate::exports::infrarust::plugin::codec_filter::Guest for $comp {
+            type FilterInstance = __RawFixtureNoopFilter;
+            fn create(
+                _factory: u64,
+                _init: crate::exports::infrarust::plugin::codec_filter::CodecSessionInit,
+            ) -> crate::exports::infrarust::plugin::codec_filter::FilterInstance {
+                crate::exports::infrarust::plugin::codec_filter::FilterInstance::new(
+                    __RawFixtureNoopFilter,
+                )
+            }
+        }
+
+        impl crate::exports::infrarust::plugin::codec_filter::GuestFilterInstance
+            for __RawFixtureNoopFilter
+        {
+            fn filter(
+                &self,
+                _packet_id: i32,
+                _data: ::std::vec::Vec<u8>,
+            ) -> crate::exports::infrarust::plugin::codec_filter::FilterVerdict {
+                crate::exports::infrarust::plugin::codec_filter::FilterVerdict::Pass
+            }
+            fn take_output(
+                &self,
+            ) -> crate::exports::infrarust::plugin::codec_filter::FilterOutput {
+                crate::exports::infrarust::plugin::codec_filter::FilterOutput::Pass
+            }
+            fn on_state_change(
+                &self,
+                _new_state: crate::exports::infrarust::plugin::codec_filter::ConnectionState,
+            ) {
+            }
+            fn on_compression_change(&self, _threshold: i32) {}
+            fn on_encryption_enabled(&self) {}
+            fn on_close(&self) {}
+        }
+    };
+}

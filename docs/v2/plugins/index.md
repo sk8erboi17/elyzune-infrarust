@@ -1,0 +1,62 @@
+---
+title: Plugins
+description: "Overview of the Infrarust plugin system: what plugins can do, built-in plugins, and how to build your own."
+---
+
+# Plugins
+
+Infrarust ships with a plugin system that lets you hook into the proxy at every stage of a player's connection. Plugins can listen for events, register commands, hold players in limbo screens, filter packets, and access proxy services like the player registry, server manager, and ban system.
+
+Native plugins are written in Rust and compiled into the proxy binary. Each one implements the `Plugin` trait from `infrarust_api`, declares metadata (id, name, version, dependencies), and receives a `PluginContext` during startup that gives access to every proxy service. WASM plugins use the same conceptual model but run in a sandbox loaded at runtime.
+
+## Native and WASM plugins
+
+Infrarust supports two plugin formats. Native plugins are Rust crates that implement the `Plugin` trait from `infrarust_api` and compile into the proxy binary; they run in-process with access to every proxy service, including transport-level filters, and the built-in plugins use this model. WASM plugins are WebAssembly components loaded at runtime from the plugins directory; they run in a capability-gated sandbox with CPU and memory limits, ship as a single `.wasm` file, and can be written in any language that targets `wasm32-wasip2` (the SDK is Rust).
+
+The [Developing Plugins](./dev/getting-started) guides cover native plugins. For the sandboxed model, start with [WASM Plugins](./wasm/).
+
+## What plugins can do
+
+React to events. The proxy fires events throughout a player's lifecycle: login, disconnect, chat messages, server switches, kicks, and more. A plugin subscribes to these events with a priority level (`FIRST`, `EARLY`, `NORMAL`, `LATE`, `LAST`) and can inspect or modify them before other listeners see them.
+
+Register commands. Plugins add proxy-level commands that players can use in chat. Commands get access to the player who ran them and can send messages, switch servers, or trigger other actions.
+
+Hold players in limbo. The limbo engine lets plugins intercept players before they reach a backend server. A limbo handler receives the player in a void world and can show titles, send chat messages, and wait for commands before releasing them. This is how the auth plugin implements its login screen and the server-wake plugin holds players while a server boots.
+
+Filter packets. Plugins can register codec-level filters to inspect or modify Minecraft protocol packets as they flow through the proxy. WASM plugins get this capability when granted `codec-filter` in the proxy config. Native plugins also have access to transport-level filters, which operate at the raw TCP stream.
+
+Schedule tasks. Plugins can run code on a fixed interval using the scheduler, for periodic cleanup, broadcasts, or polling.
+
+Provide dynamic configuration. Plugins can register a config provider that supplies server definitions from external sources (databases, APIs, service discovery) instead of static files. A provider can hand over either a built `ServerConfig` or a raw TOML document, which the proxy then parses and validates exactly as it would a file under `servers_dir`. The admin API uses the document form so that a server created over HTTP supports every key a file does.
+
+## Built-in plugins
+
+Infrarust includes three built-in plugins:
+
+| Plugin | Activation | Description |
+|--------|------------|-------------|
+| [Admin API & Web UI](./builtin/admin-api) | `[web]` section in `infrarust.toml`, with `enable_api` on | REST API and embedded web dashboard for monitoring, server and proxy configuration, and backend drain controls. |
+| [Auth](./builtin/auth) | `plugin-auth` feature flag (on by default), and `"auth"` in the `limbo_handlers` of a `client_only` or `offline` server | Password-based authentication with `/login` and `/register` commands. Holds players in limbo until authenticated. |
+| [Server Wake](./builtin/server-wake) | `plugin-server-wake` feature flag (on by default), and `"server_wake"` in the `limbo_handlers` of a `client_only` or `offline` server | Holds players in limbo while a backend server starts up, showing status messages. |
+
+Built-in plugins are registered at compile time in `crates/infrarust/src/plugins.rs` using a `StaticPluginLoader`. To enable or disable them, toggle the corresponding Cargo feature when building:
+
+```bash
+cargo build --release --features "plugin-auth,plugin-server-wake"
+```
+
+## Plugin lifecycle
+
+1. Discovery: the plugin loader scans for registered plugins and collects their metadata.
+2. Dependency resolution: plugins are sorted in dependency order. Required dependencies must be present; optional dependencies adjust ordering when available.
+3. Enable: `on_enable()` is called on each plugin with a `PluginContext`. This is where plugins register their event listeners, commands, limbo handlers, and scheduled tasks.
+4. Runtime: the proxy runs. Events flow through registered listeners. Commands are dispatched. Limbo handlers receive players.
+5. Disable: on shutdown, `on_disable()` is called in reverse dependency order. All resources the plugin registered (listeners, commands, tasks) are automatically cleaned up.
+
+## Next steps
+
+- [Admin API & Web UI](./builtin/admin-api): REST API and web dashboard for proxy management.
+- [Auth Plugin](./builtin/auth): Password authentication and limbo login screen.
+- [Server Wake Plugin](./builtin/server-wake): Hold players while backend servers start.
+- [WASM Plugins](./wasm/): Build a sandboxed plugin loaded at runtime from a `.wasm` file.
+- [Developing native plugins](./dev/getting-started): Build a plugin compiled into the proxy binary.

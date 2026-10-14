@@ -1,0 +1,76 @@
+[package]
+name = "infrarust"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+description = "Infrarust is a high-performance Minecraft proxy server written in Rust, designed for stability, security, and extensibility. Allowing players to connect to multiple backend servers seamlessly while providing features like load balancing, plugin support, and advanced configuration options."
+readme = "README.md"
+keywords = ["minecraft", "proxy", "server", "networking"]
+categories = ["game-development", "network-programming", "command-line-utilities"]
+
+[package.metadata.docs.rs]
+features = ["telemetry", "docker"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "infrarust"
+path = "src/main.rs"
+
+[features]
+default = ["default-plugins", "libdeflater", "wasm"]
+telemetry = ["infrarust-core/telemetry", "dep:opentelemetry", "dep:tracing-opentelemetry"]
+docker = ["infrarust-core/docker"]
+default-plugins = ["plugin-auth", "plugin-server-wake", "plugin-elyzune-via", "plugin-elyzune-identity"]
+libdeflater = ["infrarust-core/libdeflater"]
+plugin-auth = ["dep:infrarust-plugin-auth"]
+plugin-hello = ["dep:infrarust-plugin-hello"]
+plugin-server-wake = ["dep:infrarust-plugin-server-wake"]
+# Elyzune: translates 1.21.11, 26.1 and 26.3 clients to 26.2 backends.
+plugin-elyzune-via = ["dep:elyzune-via"]
+# Elyzune: paid Mojang names log in with Mojang, every other name with a
+# password on the game server. Inactive without its config file.
+plugin-elyzune-identity = ["dep:elyzune-identity"]
+wasm = ["dep:infrarust-loader-wasm"]
+
+[dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+dialoguer = { workspace = true }
+comfy-table = { workspace = true }
+console = { workspace = true }
+uuid = { workspace = true }
+infrarust-api = { workspace = true }
+infrarust_config = { workspace = true }
+infrarust-core = { workspace = true }
+infrarust-transport = { workspace = true }
+
+# Plugins (optional)
+infrarust-plugin-auth = { workspace = true, optional = true }
+infrarust-plugin-hello = { workspace = true, optional = true }
+infrarust-plugin-server-wake = { workspace = true, optional = true }
+elyzune-via = { workspace = true, optional = true }
+elyzune-identity = { workspace = true, optional = true }
+infrarust-plugin-admin-api = { workspace = true }
+
+infrarust-loader-wasm = { workspace = true, optional = true, features = ["wasm"] }
+
+# Telemetry (optional)
+opentelemetry = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

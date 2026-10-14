@@ -1,0 +1,22 @@
+# Minimal Infrarust proxy configuration for smoke testing
+servers_dir = "./examples/servers"
+
+# Web admin API / UI (uncomment to enable)
+# [web]
+# enable_api = true
+# enable_webui = true
+# bind = "127.0.0.1:8080"
+# api_key = "your-secure-api-key-here"
+# cors_origins = []
+#
+# [web.rate_limit]
+# requests_per_minute = 60
+
+[ban]
+file = "./examples/bans.json"
+purge_interval = "5m"
+enable_audit_log = true
+
+# Activate the web admin API and UI
+[web]
+api_key = "dev-key-please-change-me"

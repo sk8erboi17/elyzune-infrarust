@@ -1,0 +1,55 @@
+name: Pull Request Checks
+
+on:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'crates/**'
+      - 'plugins/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: clippy, rustfmt
+          targets: wasm32-wasip2
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2.9.2
+        with:
+          workspaces: |
+            .
+            plugins/infrarust-plugin-stats/wasm
+
+      - name: Build Admin Frontend
+        uses: ./.github/actions/build-frontend
+
+      - name: Check formatting
+        run: |
+          cargo fmt -- --check
+          cargo fmt --manifest-path plugins/infrarust-plugin-stats/wasm/Cargo.toml -- --check
+
+      - name: Run clippy
+        run: |
+          cargo clippy -- -D warnings
+          cargo clippy --manifest-path plugins/infrarust-plugin-stats/wasm/Cargo.toml \
+            --target wasm32-wasip2 -- -D warnings
+
+      - name: Run tests
+        run: |
+          set -o pipefail
+          cargo test 2>&1 | tee test.log
+          grep -q 'test test_stats_count_command \.\.\. ok' test.log \
+            || { echo "::error::WASM fixture tests did not run"; exit 1; }
+          grep -q 'test pre_login_deny_wasm \.\.\. ok' test.log \
+            || { echo "::error::WASM conformance tests did not run"; exit 1; }

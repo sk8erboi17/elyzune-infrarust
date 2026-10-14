@@ -1,0 +1,846 @@
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::{Arc, PoisonError, RwLock};
+
+use crate::error::ErrorKind;
+use crate::event::BoxFuture;
+use crate::types::{GameProfile, PlayerId};
+
+pub const ADMIN_PERMISSION: &str = "infrarust.admin";
+pub const COMMAND_PERMISSION_PREFIX: &str = "infrarust.command.";
+pub const WILDCARD: &str = "*";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Tristate {
+    True,
+    False,
+    #[default]
+    Undefined,
+}
+
+impl Tristate {
+    #[must_use]
+    pub const fn from_bool(value: bool) -> Self {
+        if value { Self::True } else { Self::False }
+    }
+
+    #[must_use]
+    pub const fn as_bool(self) -> Option<bool> {
+        match self {
+            Self::True => Some(true),
+            Self::False => Some(false),
+            Self::Undefined => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_true(self) -> bool {
+        matches!(self, Self::True)
+    }
+
+    #[must_use]
+    pub const fn is_defined(self) -> bool {
+        !matches!(self, Self::Undefined)
+    }
+
+    #[must_use]
+    pub const fn or(self, fallback: Self) -> Self {
+        match self {
+            Self::Undefined => fallback,
+            defined => defined,
+        }
+    }
+}
+
+impl From<bool> for Tristate {
+    fn from(value: bool) -> Self {
+        Self::from_bool(value)
+    }
+}
+
+impl From<Option<bool>> for Tristate {
+    fn from(value: Option<bool>) -> Self {
+        value.map_or(Self::Undefined, Self::from_bool)
+    }
+}
+
+pub trait PermissionChecker: Send + Sync {
+    fn value(&self, node: &str) -> Tristate;
+
+    fn has_permission(&self, node: &str) -> bool {
+        self.value(node).is_true()
+    }
+
+    fn to_snapshot(&self) -> Option<PermissionSnapshot> {
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DefaultPermissionChecker;
+
+impl PermissionChecker for DefaultPermissionChecker {
+    fn value(&self, _node: &str) -> Tristate {
+        Tristate::Undefined
+    }
+
+    fn to_snapshot(&self) -> Option<PermissionSnapshot> {
+        Some(PermissionSnapshot::new())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AllPermissionsChecker;
+
+impl PermissionChecker for AllPermissionsChecker {
+    fn value(&self, _node: &str) -> Tristate {
+        Tristate::True
+    }
+
+    fn to_snapshot(&self) -> Option<PermissionSnapshot> {
+        Some(PermissionSnapshot::new().with_admin(true))
+    }
+}
+
+#[must_use]
+pub fn normalize_node(node: &str) -> Cow<'_, str> {
+    let node = node.trim();
+    if node.chars().any(char::is_uppercase) {
+        Cow::Owned(node.to_lowercase())
+    } else {
+        Cow::Borrowed(node)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PermissionMap {
+    nodes: HashMap<String, bool>,
+}
+
+impl PermissionMap {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn with(mut self, node: &str, value: bool) -> Self {
+        self.set(node, value);
+        self
+    }
+
+    pub fn set(&mut self, node: &str, value: bool) {
+        self.nodes.insert(normalize_node(node).into_owned(), value);
+    }
+
+    pub fn unset(&mut self, node: &str) -> Option<bool> {
+        self.nodes.remove(normalize_node(node).as_ref())
+    }
+
+    #[must_use]
+    pub fn get(&self, node: &str) -> Option<bool> {
+        self.nodes.get(normalize_node(node).as_ref()).copied()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, bool)> {
+        self.nodes
+            .iter()
+            .map(|(node, value)| (node.as_str(), *value))
+    }
+
+    fn lookup(&self, node: &str) -> Option<bool> {
+        let node = normalize_node(node);
+        if let Some(value) = self.nodes.get(node.as_ref()) {
+            return Some(*value);
+        }
+        let mut key = String::with_capacity(node.len() + WILDCARD.len() + 1);
+        let mut end = node.len();
+        while let Some(dot) = node[..end].rfind('.') {
+            key.clear();
+            key.push_str(&node[..=dot]);
+            key.push_str(WILDCARD);
+            if let Some(value) = self.nodes.get(key.as_str()) {
+                return Some(*value);
+            }
+            end = dot;
+        }
+        self.nodes.get(WILDCARD).copied()
+    }
+}
+
+impl PermissionChecker for PermissionMap {
+    fn value(&self, node: &str) -> Tristate {
+        self.lookup(node).into()
+    }
+
+    fn to_snapshot(&self) -> Option<PermissionSnapshot> {
+        Some(PermissionSnapshot::from(self.clone()))
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PermissionSnapshot {
+    rules: PermissionMap,
+    admin: bool,
+}
+
+impl PermissionSnapshot {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn with(mut self, node: &str, value: bool) -> Self {
+        self.rules.set(node, value);
+        self
+    }
+
+    pub fn set(&mut self, node: &str, value: bool) {
+        self.rules.set(node, value);
+    }
+
+    pub fn unset(&mut self, node: &str) -> Option<bool> {
+        self.rules.unset(node)
+    }
+
+    #[must_use]
+    pub const fn with_admin(mut self, admin: bool) -> Self {
+        self.admin = admin;
+        self
+    }
+
+    pub const fn set_admin(&mut self, admin: bool) {
+        self.admin = admin;
+    }
+
+    #[must_use]
+    pub const fn is_admin(&self) -> bool {
+        self.admin
+    }
+
+    #[must_use]
+    pub const fn rules(&self) -> &PermissionMap {
+        &self.rules
+    }
+}
+
+impl From<PermissionMap> for PermissionSnapshot {
+    fn from(rules: PermissionMap) -> Self {
+        Self {
+            rules,
+            admin: false,
+        }
+    }
+}
+
+impl PermissionChecker for PermissionSnapshot {
+    fn value(&self, node: &str) -> Tristate {
+        if self.admin {
+            Tristate::True
+        } else {
+            self.rules.value(node)
+        }
+    }
+
+    fn to_snapshot(&self) -> Option<PermissionSnapshot> {
+        Some(self.clone())
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct SnapshotPermissionChecker {
+    snapshot: RwLock<Arc<PermissionSnapshot>>,
+}
+
+impl SnapshotPermissionChecker {
+    #[must_use]
+    pub fn new(snapshot: PermissionSnapshot) -> Self {
+        Self {
+            snapshot: RwLock::new(Arc::new(snapshot)),
+        }
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> Arc<PermissionSnapshot> {
+        Arc::clone(&self.snapshot.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    pub fn replace(&self, snapshot: PermissionSnapshot) -> Arc<PermissionSnapshot> {
+        std::mem::replace(
+            &mut *self
+                .snapshot
+                .write()
+                .unwrap_or_else(PoisonError::into_inner),
+            Arc::new(snapshot),
+        )
+    }
+}
+
+impl PermissionChecker for SnapshotPermissionChecker {
+    fn value(&self, node: &str) -> Tristate {
+        self.snapshot().value(node)
+    }
+
+    fn to_snapshot(&self) -> Option<PermissionSnapshot> {
+        Some(PermissionSnapshot::clone(&self.snapshot()))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PermissionDefault {
+    False,
+    True,
+    Admin,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PermissionNode {
+    pub name: String,
+    pub description: String,
+    pub default: PermissionDefault,
+}
+
+impl PermissionNode {
+    pub fn new(name: impl Into<String>, default: PermissionDefault) -> Self {
+        Self {
+            name: name.into(),
+            description: String::new(),
+            default,
+        }
+    }
+
+    #[must_use]
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = description.into();
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PermissionNodeInfo {
+    pub node: PermissionNode,
+    pub plugin_id: Option<String>,
+}
+
+impl PermissionNodeInfo {
+    pub fn new(node: PermissionNode, plugin_id: Option<String>) -> Self {
+        Self { node, plugin_id }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum PermissionNodeError {
+    #[error("'{0}' is not a valid permission node")]
+    InvalidName(String),
+    #[error("'{0}' is reserved by the proxy")]
+    Reserved(String),
+    #[error("'{name}' is already registered by plugin '{plugin}'")]
+    OwnedBy { name: String, plugin: String },
+}
+
+impl PermissionNodeError {
+    pub const fn kind(&self) -> ErrorKind {
+        match self {
+            Self::InvalidName(_) => ErrorKind::InvalidArgument,
+            Self::Reserved(_) | Self::OwnedBy { .. } => ErrorKind::Conflict,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PermissionSubject {
+    #[non_exhaustive]
+    Player {
+        player_id: PlayerId,
+        profile: GameProfile,
+        online_mode: bool,
+        virtual_host: Option<String>,
+        remote_addr: SocketAddr,
+    },
+    Console,
+}
+
+impl PermissionSubject {
+    pub fn player(
+        player_id: PlayerId,
+        profile: GameProfile,
+        online_mode: bool,
+        remote_addr: SocketAddr,
+    ) -> Self {
+        Self::Player {
+            player_id,
+            profile,
+            online_mode,
+            virtual_host: None,
+            remote_addr,
+        }
+    }
+
+    #[must_use]
+    pub fn with_virtual_host(mut self, host: impl Into<String>) -> Self {
+        if let Self::Player { virtual_host, .. } = &mut self {
+            *virtual_host = Some(host.into());
+        }
+        self
+    }
+
+    pub fn player_id(&self) -> Option<PlayerId> {
+        match self {
+            Self::Player { player_id, .. } => Some(*player_id),
+            Self::Console => None,
+        }
+    }
+
+    pub fn profile(&self) -> Option<&GameProfile> {
+        match self {
+            Self::Player { profile, .. } => Some(profile),
+            Self::Console => None,
+        }
+    }
+
+    pub fn is_online_mode(&self) -> bool {
+        matches!(
+            self,
+            Self::Player {
+                online_mode: true,
+                ..
+            }
+        )
+    }
+
+    pub fn virtual_host(&self) -> Option<&str> {
+        match self {
+            Self::Player { virtual_host, .. } => virtual_host.as_deref(),
+            Self::Console => None,
+        }
+    }
+
+    pub fn remote_addr(&self) -> Option<SocketAddr> {
+        match self {
+            Self::Player { remote_addr, .. } => Some(*remote_addr),
+            Self::Console => None,
+        }
+    }
+
+    pub const fn is_console(&self) -> bool {
+        matches!(self, Self::Console)
+    }
+}
+
+pub trait PermissionProvider: Send + Sync {
+    fn create_checker<'a>(
+        &'a self,
+        subject: &'a PermissionSubject,
+    ) -> BoxFuture<'a, Arc<dyn PermissionChecker>>;
+}
+
+pub use infrarust_plugin_common::capability::Capability;
+
+/// The set of [`Capability`]s granted to a plugin.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct CapabilitySet {
+    granted: u32,
+}
+
+const _: () = assert!(Capability::ALL.len() <= u32::BITS as usize);
+
+const fn bit(cap: Capability) -> u32 {
+    1 << cap.index()
+}
+
+impl std::fmt::Debug for CapabilitySet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set().entries(self.iter()).finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum CapabilityRejection {
+    #[error("unknown capability `{0}`")]
+    Unknown(String),
+
+    #[error("capability `{0}` cannot be granted through configuration")]
+    NotGrantable(Capability),
+}
+
+impl CapabilitySet {
+    #[must_use]
+    pub const fn has(&self, cap: Capability) -> bool {
+        self.granted & bit(cap) != 0
+    }
+
+    pub const fn insert(&mut self, cap: Capability) {
+        self.granted |= bit(cap);
+    }
+
+    pub const fn remove(&mut self, cap: Capability) {
+        self.granted &= !bit(cap);
+    }
+
+    #[must_use]
+    pub const fn with(mut self, cap: Capability) -> Self {
+        self.insert(cap);
+        self
+    }
+
+    #[must_use]
+    pub const fn without(mut self, cap: Capability) -> Self {
+        self.remove(cap);
+        self
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = Capability> + '_ {
+        Capability::ALL.iter().copied().filter(|cap| self.has(*cap))
+    }
+
+    #[must_use]
+    pub fn baseline() -> Self {
+        Self::default()
+            .with(Capability::EventBus)
+            .with(Capability::PlayerRead)
+            .with(Capability::PlayerWrite)
+            .with(Capability::Command)
+            .with(Capability::Scheduler)
+            .with(Capability::ConfigRead)
+    }
+
+    #[must_use]
+    pub fn native_trusted() -> Self {
+        let mut set = Self::default();
+        for &cap in Capability::ALL {
+            set.insert(cap);
+        }
+        set
+    }
+
+    #[must_use]
+    pub fn from_config_strings(strings: &[String]) -> (Self, Vec<CapabilityRejection>) {
+        let mut set = Self::baseline();
+        let mut rejected = Vec::new();
+        for s in strings {
+            match Capability::from_kebab(s) {
+                None => rejected.push(CapabilityRejection::Unknown(s.clone())),
+                Some(Capability::TransportFilter) => {
+                    rejected.push(CapabilityRejection::NotGrantable(
+                        Capability::TransportFilter,
+                    ));
+                }
+                Some(cap) => set.insert(cap),
+            }
+        }
+        (set, rejected)
+    }
+
+    #[must_use]
+    pub fn revoke_config_strings(&mut self, strings: &[String]) -> Vec<CapabilityRejection> {
+        let mut unknown = Vec::new();
+        for s in strings {
+            match Capability::from_kebab(s) {
+                Some(cap) => self.remove(cap),
+                None => unknown.push(CapabilityRejection::Unknown(s.clone())),
+            }
+        }
+        unknown
+    }
+
+    #[must_use]
+    pub fn from_config(grants: &[String], denies: &[String]) -> (Self, Vec<CapabilityRejection>) {
+        let (mut set, mut rejected) = Self::from_config_strings(grants);
+        rejected.extend(set.revoke_config_strings(denies));
+        (set, rejected)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+
+    #[test]
+    fn default_checker_leaves_every_node_undefined() {
+        let checker = DefaultPermissionChecker;
+        assert_eq!(checker.value(ADMIN_PERMISSION), Tristate::Undefined);
+        assert!(!checker.has_permission("anything"));
+        assert!(AllPermissionsChecker.has_permission("anything"));
+    }
+
+    #[test]
+    fn tristate_falls_back_only_when_undefined() {
+        assert_eq!(Tristate::Undefined.or(Tristate::True), Tristate::True);
+        assert_eq!(Tristate::False.or(Tristate::True), Tristate::False);
+        assert_eq!(Tristate::from(Some(true)), Tristate::True);
+        assert_eq!(Tristate::from(None), Tristate::Undefined);
+        assert_eq!(Tristate::True.as_bool(), Some(true));
+        assert_eq!(Tristate::Undefined.as_bool(), None);
+    }
+
+    #[test]
+    fn a_wildcard_covers_every_child_but_not_its_parent() {
+        let map = PermissionMap::new().with("demo.*", true);
+        assert_eq!(map.value("demo.use"), Tristate::True);
+        assert_eq!(map.value("demo.admin.reload"), Tristate::True);
+        assert_eq!(map.value("demo"), Tristate::Undefined);
+        assert_eq!(map.value("demolition.use"), Tristate::Undefined);
+    }
+
+    #[test]
+    fn wildcards_are_tried_from_the_deepest_ancestor_up_to_the_root() {
+        let map = PermissionMap::new()
+            .with("*", false)
+            .with("a.*", true)
+            .with("a.b.*", false)
+            .with("a.b.c.d", true);
+        assert_eq!(map.value("a.b.c.d"), Tristate::True);
+        assert_eq!(map.value("a.b.c.e"), Tristate::False);
+        assert_eq!(map.value("a.b.c"), Tristate::False);
+        assert_eq!(map.value("a.b"), Tristate::True);
+        assert_eq!(map.value("a.x.y"), Tristate::True);
+        assert_eq!(map.value("a"), Tristate::False);
+        assert_eq!(map.value("ab.c"), Tristate::False);
+        assert_eq!(map.value(" A.B.Z "), Tristate::False);
+        assert_eq!(map.value("a.b."), Tristate::False);
+        assert_eq!(map.value(".a"), Tristate::False);
+        assert_eq!(
+            PermissionMap::new().with("a.*", true).value("b.c"),
+            Tristate::Undefined
+        );
+        assert_eq!(
+            PermissionMap::new().with("a.*", true).value("a.*"),
+            Tristate::True
+        );
+    }
+
+    #[test]
+    fn the_most_specific_entry_wins() {
+        let map = PermissionMap::new()
+            .with("*", true)
+            .with("demo.*", false)
+            .with("demo.use", true);
+        assert_eq!(map.value("demo.use"), Tristate::True);
+        assert_eq!(map.value("demo.kick"), Tristate::False);
+        assert_eq!(map.value("other.node"), Tristate::True);
+        assert_eq!(map.value("single"), Tristate::True);
+    }
+
+    #[test]
+    fn a_snapshot_answers_like_its_rules_and_admin_answers_everything() {
+        let snapshot = PermissionSnapshot::new()
+            .with("*", true)
+            .with("demo.*", false)
+            .with("Demo.Use", true);
+        assert_eq!(snapshot.value("demo.use"), Tristate::True);
+        assert_eq!(snapshot.value("demo.kick"), Tristate::False);
+        assert_eq!(snapshot.value("other"), Tristate::True);
+        assert_eq!(
+            PermissionSnapshot::new()
+                .with("demo.use", true)
+                .value("demo"),
+            Tristate::Undefined
+        );
+        let admin = PermissionSnapshot::new()
+            .with("demo.use", false)
+            .with_admin(true);
+        assert!(admin.is_admin());
+        assert_eq!(admin.value("demo.use"), Tristate::True);
+        assert_eq!(admin.value(ADMIN_PERMISSION), Tristate::True);
+        assert_eq!(
+            PermissionSnapshot::new().value(ADMIN_PERMISSION),
+            Tristate::Undefined
+        );
+    }
+
+    #[test]
+    fn a_snapshot_checker_answers_with_the_latest_snapshot() {
+        let checker = SnapshotPermissionChecker::new(PermissionSnapshot::new());
+        assert_eq!(checker.value("demo.use"), Tristate::Undefined);
+        let previous = checker.replace(PermissionSnapshot::new().with("demo.use", true));
+        assert_eq!(*previous, PermissionSnapshot::new());
+        assert!(checker.has_permission("demo.use"));
+        assert_eq!(
+            checker.to_snapshot(),
+            Some(PermissionSnapshot::new().with("demo.use", true))
+        );
+        checker.replace(PermissionSnapshot::new().with_admin(true));
+        assert!(checker.has_permission("anything.at.all"));
+    }
+
+    #[test]
+    fn the_plain_checkers_describe_themselves_as_snapshots() {
+        assert_eq!(
+            DefaultPermissionChecker.to_snapshot(),
+            Some(PermissionSnapshot::new())
+        );
+        assert_eq!(
+            AllPermissionsChecker.to_snapshot(),
+            Some(PermissionSnapshot::new().with_admin(true))
+        );
+        let map = PermissionMap::new().with("demo.*", true);
+        let snapshot = map.to_snapshot().unwrap();
+        assert_eq!(snapshot.rules(), &map);
+        assert!(!snapshot.is_admin());
+    }
+
+    #[test]
+    fn nodes_are_case_insensitive() {
+        let mut map = PermissionMap::new().with("Demo.Use", true);
+        assert_eq!(map.value("DEMO.USE"), Tristate::True);
+        assert_eq!(map.get("demo.use"), Some(true));
+        assert_eq!(map.unset("demo.USE"), Some(true));
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn a_player_subject_carries_its_connection() {
+        let profile = GameProfile {
+            uuid: uuid::Uuid::nil(),
+            username: "Steve".into(),
+            properties: vec![],
+        };
+        let subject = PermissionSubject::player(
+            PlayerId::new(7),
+            profile.clone(),
+            true,
+            "127.0.0.1:1".parse().unwrap(),
+        )
+        .with_virtual_host("play.example.com");
+        assert_eq!(subject.player_id(), Some(PlayerId::new(7)));
+        assert_eq!(subject.profile(), Some(&profile));
+        assert!(subject.is_online_mode());
+        assert_eq!(subject.virtual_host(), Some("play.example.com"));
+        assert!(!subject.is_console());
+        assert!(PermissionSubject::Console.is_console());
+        assert_eq!(PermissionSubject::Console.virtual_host(), None);
+    }
+
+    #[test]
+    fn baseline_contains_only_default_grants() {
+        let b = CapabilitySet::baseline();
+        for cap in [
+            Capability::EventBus,
+            Capability::PlayerRead,
+            Capability::PlayerWrite,
+            Capability::Command,
+            Capability::Scheduler,
+            Capability::ConfigRead,
+        ] {
+            assert!(b.has(cap), "baseline missing {cap:?}");
+        }
+        assert!(!b.has(Capability::Ban));
+        assert!(!b.has(Capability::ConfigWrite));
+        assert!(!b.has(Capability::CodecFilter));
+        assert!(!b.has(Capability::TransportFilter));
+        assert!(!b.has(Capability::ChatIntercept));
+        assert!(!b.has(Capability::BanProvider));
+        assert!(!b.has(Capability::PluginMessaging));
+    }
+
+    #[test]
+    fn a_set_adds_removes_and_lists_its_capabilities() {
+        let mut set = CapabilitySet::default().with(Capability::PluginMessaging);
+        set.insert(Capability::EventBus);
+        set.insert(Capability::EventBus);
+        assert!(set.has(Capability::EventBus));
+        assert!(set.has(Capability::PluginMessaging));
+        assert!(!set.has(Capability::Ban));
+        assert_eq!(
+            set.iter().collect::<Vec<_>>(),
+            [Capability::EventBus, Capability::PluginMessaging]
+        );
+        assert_eq!(format!("{set:?}"), "{EventBus, PluginMessaging}");
+        set.remove(Capability::EventBus);
+        assert_eq!(
+            set,
+            CapabilitySet::default().with(Capability::PluginMessaging)
+        );
+        assert_eq!(
+            set.without(Capability::PluginMessaging),
+            CapabilitySet::default()
+        );
+    }
+
+    #[test]
+    fn native_trusted_contains_every_capability() {
+        let t = CapabilitySet::native_trusted();
+        for &cap in Capability::ALL {
+            assert!(t.has(cap), "native_trusted missing {cap:?}");
+        }
+        assert!(t.has(Capability::TransportFilter));
+    }
+
+    #[test]
+    fn from_config_strings_adds_opt_ins_over_baseline() {
+        let (set, rejected) = CapabilitySet::from_config_strings(&[
+            "server-manage".to_string(),
+            "codec-filter".to_string(),
+        ]);
+        assert!(set.has(Capability::ServerManage));
+        assert!(set.has(Capability::CodecFilter));
+        assert!(set.has(Capability::EventBus), "baseline must be preserved");
+        assert!(rejected.is_empty());
+    }
+
+    #[test]
+    fn from_config_strings_collects_unknown_and_refuses_transport_filter() {
+        let (set, rejected) = CapabilitySet::from_config_strings(&[
+            "ban-all".to_string(),          // unknown
+            "transport-filter".to_string(), // known but never grantable via config
+            "ban".to_string(),              // valid opt-in
+        ]);
+        assert!(set.has(Capability::Ban));
+        assert!(!set.has(Capability::TransportFilter));
+        assert_eq!(
+            rejected,
+            [
+                CapabilityRejection::Unknown("ban-all".to_string()),
+                CapabilityRejection::NotGrantable(Capability::TransportFilter),
+            ]
+        );
+    }
+
+    #[test]
+    fn from_config_revokes_denies_after_baseline_and_grants() {
+        let (set, rejected) = CapabilitySet::from_config(
+            &["ban".to_string(), "limbo".to_string()],
+            &[
+                "player-write".to_string(),
+                "ban".to_string(),
+                "not-a-capability".to_string(),
+            ],
+        );
+        assert!(!set.has(Capability::PlayerWrite));
+        assert!(!set.has(Capability::Ban));
+        assert!(set.has(Capability::Limbo));
+        assert!(set.has(Capability::EventBus));
+        assert_eq!(
+            rejected,
+            [CapabilityRejection::Unknown("not-a-capability".to_string())]
+        );
+    }
+
+    #[test]
+    fn revoke_config_strings_can_strip_a_trusted_set() {
+        let mut set = CapabilitySet::native_trusted();
+        let unknown = set.revoke_config_strings(&["transport-filter".to_string()]);
+        assert!(unknown.is_empty());
+        assert!(!set.has(Capability::TransportFilter));
+        assert!(set.has(Capability::CodecFilter));
+    }
+}

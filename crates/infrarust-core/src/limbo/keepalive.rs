@@ -1,0 +1,218 @@
+//! KeepAlive state machine for the Limbo loop.
+//!
+//! Tracks sent keepalive IDs, enforces the 15-second timeout, and provides
+//! helpers for detecting and extracting serverbound keepalive responses.
+
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use tokio::time::Instant;
+
+use infrarust_protocol::io::PacketFrame;
+use infrarust_protocol::packets::Packet;
+use infrarust_protocol::packets::play::keepalive::{CKeepAlive, SKeepAlive};
+use infrarust_protocol::registry::PacketRegistry;
+use infrarust_protocol::version::ProtocolVersion;
+
+use crate::error::CoreError;
+use crate::player::packets::encode_packet;
+
+/// Maximum time (seconds) to wait for a keepalive response before
+/// considering the client timed out.
+const KEEPALIVE_TIMEOUT_SECS: u64 = 15;
+
+/// Outcome of a keepalive interval tick.
+pub(crate) enum KeepAliveTick {
+    Send(PacketFrame),
+    Idle,
+    Timeout,
+}
+
+/// Tracks the keepalive handshake with a single client.
+pub(crate) struct KeepAliveState {
+    last_sent_id: i64,
+    last_sent_at: Instant,
+    awaiting_response: bool,
+}
+
+impl KeepAliveState {
+    pub fn new() -> Self {
+        Self {
+            last_sent_id: 0,
+            last_sent_at: Instant::now(),
+            awaiting_response: false,
+        }
+    }
+
+    /// Advances the keepalive state machine on a periodic interval tick.
+    ///
+    /// - If no keepalive is outstanding, emits a fresh ping ([`KeepAliveTick::Send`]).
+    /// - If a keepalive is outstanding but the grace window has not elapsed,
+    ///   returns [`KeepAliveTick::Idle`] (it deliberately does **not** send another
+    ///   ping, which would reset the timer so the timeout could never fire).
+    /// - If a keepalive is outstanding past the timeout, returns
+    ///   [`KeepAliveTick::Timeout`] so the caller can drop the connection.
+    ///
+    /// This separation is what makes the timeout reachable when the tick interval
+    /// is shorter than `KEEPALIVE_TIMEOUT_SECS`.
+    pub fn tick(
+        &mut self,
+        version: ProtocolVersion,
+        registry: &PacketRegistry,
+    ) -> Result<KeepAliveTick, CoreError> {
+        if self.awaiting_response {
+            if self.last_sent_at.elapsed() >= Duration::from_secs(KEEPALIVE_TIMEOUT_SECS) {
+                return Ok(KeepAliveTick::Timeout);
+            }
+            return Ok(KeepAliveTick::Idle);
+        }
+
+        let id = if version.less_than(ProtocolVersion::V1_12_2) {
+            i64::from(rand::random::<i32>())
+        } else {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64
+        };
+
+        self.last_sent_id = id;
+        self.last_sent_at = Instant::now();
+        self.awaiting_response = true;
+
+        let frame = encode_packet(&CKeepAlive { id }, version, registry)?;
+        Ok(KeepAliveTick::Send(frame))
+    }
+
+    /// Processes a keepalive response from the client.
+    ///
+    /// Returns the round trip time if the ID matches the last sent keepalive,
+    /// clearing the pending state. Returns `None` on mismatch.
+    pub fn on_response(&mut self, id: i64) -> Option<Duration> {
+        if self.awaiting_response && id == self.last_sent_id {
+            self.awaiting_response = false;
+            Some(self.last_sent_at.elapsed())
+        } else {
+            None
+        }
+    }
+}
+
+/// Returns `true` if the frame is a serverbound `SKeepAlive` packet.
+pub(crate) fn is_keepalive_response(
+    frame: &PacketFrame,
+    registry: &PacketRegistry,
+    version: ProtocolVersion,
+) -> bool {
+    let expected_id = registry.get_packet_id::<SKeepAlive>(version);
+    Some(frame.id) == expected_id
+}
+
+/// Extracts the keepalive ID from a serverbound `SKeepAlive` frame.
+///
+/// Returns `None` if decoding fails.
+pub(crate) fn extract_keepalive_id(frame: &PacketFrame, version: ProtocolVersion) -> Option<i64> {
+    let mut data = frame.payload.as_ref();
+    SKeepAlive::decode(&mut data, version)
+        .ok()
+        .map(|pkt| pkt.id)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::super::test_helpers::test_registry;
+    use super::*;
+
+    #[test]
+    fn tick_sends_on_first_call() {
+        let registry = test_registry();
+        let mut state = KeepAliveState::new();
+
+        let result = state.tick(ProtocolVersion::V1_21, &registry).unwrap();
+        assert!(
+            matches!(result, KeepAliveTick::Send(_)),
+            "first tick should produce a frame"
+        );
+        assert!(state.awaiting_response);
+    }
+
+    #[test]
+    fn second_tick_without_response_is_idle_not_resend() {
+        // Regression: previously every tick reset `last_sent_at` and re-sent a
+        // ping, so the timeout could never accumulate. A second tick while still
+        // awaiting a response must NOT send another ping — it must idle so the
+        // timer keeps running. No backdating required to expose the old bug.
+        let registry = test_registry();
+        let mut state = KeepAliveState::new();
+
+        assert!(matches!(
+            state.tick(ProtocolVersion::V1_21, &registry).unwrap(),
+            KeepAliveTick::Send(_)
+        ));
+        let result = state.tick(ProtocolVersion::V1_21, &registry).unwrap();
+        assert!(
+            matches!(result, KeepAliveTick::Idle),
+            "a second tick with no response must idle, not resend"
+        );
+    }
+
+    #[test]
+    fn tick_times_out_after_grace_without_response() {
+        let registry = test_registry();
+        let mut state = KeepAliveState::new();
+
+        let _ = state.tick(ProtocolVersion::V1_21, &registry).unwrap();
+        // Advance time past the timeout while still awaiting the response.
+        state.last_sent_at = Instant::now() - Duration::from_secs(KEEPALIVE_TIMEOUT_SECS + 1);
+
+        let result = state.tick(ProtocolVersion::V1_21, &registry).unwrap();
+        assert!(
+            matches!(result, KeepAliveTick::Timeout),
+            "an unanswered keepalive past the grace window must time out"
+        );
+    }
+
+    #[test]
+    fn tick_resends_after_a_valid_response() {
+        let registry = test_registry();
+        let mut state = KeepAliveState::new();
+
+        let _ = state.tick(ProtocolVersion::V1_21, &registry).unwrap();
+        assert!(
+            state.on_response(state.last_sent_id).is_some(),
+            "valid id clears pending"
+        );
+        assert!(!state.awaiting_response);
+
+        let result = state.tick(ProtocolVersion::V1_21, &registry).unwrap();
+        assert!(
+            matches!(result, KeepAliveTick::Send(_)),
+            "after a confirmed response the next tick sends a fresh ping"
+        );
+    }
+
+    #[test]
+    fn on_response_correct_id() {
+        let mut state = KeepAliveState::new();
+        state.last_sent_id = 42;
+        state.awaiting_response = true;
+
+        assert!(state.on_response(42).is_some());
+        assert!(!state.awaiting_response);
+        assert!(
+            state.on_response(42).is_none(),
+            "a second answer measures nothing"
+        );
+    }
+
+    #[test]
+    fn on_response_wrong_id() {
+        let mut state = KeepAliveState::new();
+        state.last_sent_id = 42;
+        state.awaiting_response = true;
+
+        assert!(state.on_response(99).is_none());
+        assert!(state.awaiting_response);
+    }
+}

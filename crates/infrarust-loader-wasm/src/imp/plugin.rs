@@ -1,0 +1,143 @@
+use std::sync::Arc;
+
+use crate::actor::{CallFailure, JobKind, PluginActor};
+use crate::bindings::exports::infrarust::plugin::guest::{DisableReason, EnableReason};
+use crate::error::WasmLoaderError;
+use crate::supervisor::EnableRefused;
+use infrarust_api::error::PluginError;
+use infrarust_api::event::BoxFuture;
+use infrarust_api::plugin::{Plugin, PluginContext, PluginMetadata, PluginRuntimeStatus};
+
+pub(crate) struct WasmPlugin {
+    metadata: PluginMetadata,
+    plugin_id: String,
+    actor: Arc<PluginActor>,
+    shutting_down: Box<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl WasmPlugin {
+    pub(crate) fn new(
+        metadata: PluginMetadata,
+        actor: Arc<PluginActor>,
+        shutting_down: Box<dyn Fn() -> bool + Send + Sync>,
+    ) -> Self {
+        let plugin_id = metadata.id.clone();
+        Self {
+            metadata,
+            plugin_id,
+            actor,
+            shutting_down,
+        }
+    }
+
+    fn disable_reason(&self) -> DisableReason {
+        if (self.shutting_down)() {
+            DisableReason::Shutdown
+        } else {
+            DisableReason::Unload
+        }
+    }
+
+    fn lifecycle_error(&self, op: &'static str, failure: CallFailure) -> WasmLoaderError {
+        match failure {
+            CallFailure::Trapped(trap) => WasmLoaderError::Trap {
+                plugin_id: self.plugin_id.clone(),
+                op,
+                trap,
+            },
+            failure => WasmLoaderError::CallFailed {
+                plugin_id: self.plugin_id.clone(),
+                op,
+                source: Box::new(failure),
+            },
+        }
+    }
+}
+
+impl Plugin for WasmPlugin {
+    fn metadata(&self) -> PluginMetadata {
+        self.metadata.clone()
+    }
+
+    fn on_enable<'a>(
+        &'a self,
+        _ctx: &'a dyn PluginContext,
+    ) -> BoxFuture<'a, Result<(), PluginError>> {
+        debug_assert_eq!(_ctx.plugin_id(), self.plugin_id);
+        Box::pin(async move {
+            let result = self
+                .actor
+                .call_lifecycle("on-enable", JobKind::Enable, |store, bindings| {
+                    Box::pin(async move {
+                        bindings
+                            .infrarust_plugin_guest()
+                            .call_on_enable(&mut *store, &EnableReason::Initial)
+                            .await?
+                            .map_err(|message| wasmtime::Error::new(EnableRefused(message)))
+                    })
+                })
+                .await;
+            let Err(failure) = result else {
+                return Ok(());
+            };
+            if let CallFailure::Abandoned(fault) = &failure
+                && let Some(message) = fault.refusal()
+            {
+                tracing::warn!(plugin = %self.plugin_id, %message,
+                    "wasm guest on_enable returned an error");
+                return Err(PluginError::InitFailed(message.to_owned()));
+            }
+            Err(self
+                .lifecycle_error("on-enable", failure)
+                .into_plugin_error())
+        })
+    }
+
+    fn on_disable(&self) -> BoxFuture<'_, Result<(), PluginError>> {
+        let reason = self.disable_reason();
+        Box::pin(async move {
+            let result = self
+                .actor
+                .call_lifecycle("on-disable", JobKind::Disable, move |store, bindings| {
+                    Box::pin(async move {
+                        bindings
+                            .infrarust_plugin_guest()
+                            .call_on_disable(&mut *store, reason)
+                            .await
+                    })
+                })
+                .await;
+            self.actor.shutdown().await;
+            match result {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(message)) => {
+                    tracing::warn!(plugin = %self.plugin_id, %message,
+                        "wasm guest on_disable returned an error");
+                    Err(PluginError::from(message))
+                }
+                Err(CallFailure::Quarantined) => {
+                    tracing::warn!(plugin = %self.plugin_id,
+                        "skipping on_disable for a quarantined wasm plugin: it has no live instance");
+                    Ok(())
+                }
+                Err(CallFailure::Failed) => {
+                    tracing::warn!(plugin = %self.plugin_id,
+                        "skipping on_disable for a wasm plugin that failed before it was enabled");
+                    Ok(())
+                }
+                Err(CallFailure::Stopped) => {
+                    tracing::debug!(plugin = %self.plugin_id,
+                        "skipping on_disable for a wasm plugin that is already stopped");
+                    Ok(())
+                }
+                Err(failure) => Err(PluginError::Other(Box::new(
+                    self.lifecycle_error("on-disable", failure),
+                ))),
+            }
+        })
+    }
+
+    fn runtime_status(&self) -> Option<PluginRuntimeStatus> {
+        Some(self.actor.runtime_status())
+    }
+}

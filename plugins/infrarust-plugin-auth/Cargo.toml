@@ -1,0 +1,38 @@
+[package]
+name = "infrarust-plugin-auth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+description = "Offline-mode authentication plugin for the Infrarust Minecraft proxy (login/register, premium auto-login)"
+keywords = ["minecraft", "proxy", "plugin", "authentication"]
+categories = ["game-development", "authentication"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
+
+[dependencies]
+infrarust-api = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+dashmap = { workspace = true }
+toml = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+argon2 = { workspace = true }
+bcrypt = { workspace = true }
+reqwest = { workspace = true }
+governor = { workspace = true }
+
+[dev-dependencies]
+infrarust-api = { workspace = true, features = ["test-util"] }
+tempfile = { workspace = true }

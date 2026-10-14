@@ -1,0 +1,156 @@
+use std::fmt;
+use std::io::Write;
+
+use crate::codec::{Decode, Encode};
+use crate::error::{ProtocolError, ProtocolResult};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct VarLong(pub i64);
+
+impl VarLong {
+    pub const MAX_SIZE: usize = 10;
+
+    pub const fn written_size(self) -> usize {
+        match self.0 {
+            0 => 1,
+            n => (63 - n.leading_zeros() as usize) / 7 + 1,
+        }
+    }
+
+    pub fn encode(&self, w: &mut (impl Write + ?Sized)) -> ProtocolResult<()> {
+        let mut val = self.0 as u64;
+        loop {
+            let byte = (val & 0x7F) as u8;
+            val >>= 7;
+            if val == 0 {
+                w.write_all(&[byte])?;
+                return Ok(());
+            }
+            w.write_all(&[byte | 0x80])?;
+        }
+    }
+
+    pub fn decode(r: &mut &[u8]) -> ProtocolResult<Self> {
+        let mut val = 0i64;
+        for i in 0..Self::MAX_SIZE {
+            if r.is_empty() {
+                return Err(ProtocolError::Incomplete { context: "VarLong" });
+            }
+            let byte = r[0];
+            *r = &r[1..];
+            val |= (i64::from(byte) & 0x7F) << (i * 7);
+            if byte & 0x80 == 0 {
+                return Ok(Self(val));
+            }
+        }
+        Err(ProtocolError::invalid("VarLong too large (> 10 bytes)"))
+    }
+}
+
+impl Encode for VarLong {
+    fn encode(&self, w: &mut (impl Write + ?Sized)) -> ProtocolResult<()> {
+        Self::encode(self, w)
+    }
+}
+
+impl Decode<'_> for VarLong {
+    fn decode(r: &mut &[u8]) -> ProtocolResult<Self> {
+        Self::decode(r)
+    }
+}
+
+impl From<i64> for VarLong {
+    fn from(val: i64) -> Self {
+        Self(val)
+    }
+}
+
+impl From<VarLong> for i64 {
+    fn from(val: VarLong) -> Self {
+        val.0
+    }
+}
+
+impl fmt::Display for VarLong {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+
+    #[test]
+    fn test_round_trip() {
+        for &val in &[0i64, 1, -1, i64::MIN, i64::MAX] {
+            let vl = VarLong(val);
+            let mut buf = Vec::new();
+            vl.encode(&mut buf).unwrap();
+            let mut slice: &[u8] = &buf;
+            let decoded = VarLong::decode(&mut slice).unwrap();
+            assert_eq!(vl, decoded, "round-trip failed for {val}");
+            assert!(slice.is_empty(), "trailing bytes for {val}");
+        }
+    }
+
+    #[test]
+    fn test_written_size() {
+        for &val in &[0i64, 1, -1, i64::MIN, i64::MAX] {
+            let vl = VarLong(val);
+            let mut buf = Vec::new();
+            vl.encode(&mut buf).unwrap();
+            assert_eq!(
+                vl.written_size(),
+                buf.len(),
+                "written_size mismatch for {val}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_decode_too_large() {
+        let mut buf: &[u8] = &[0x80; 11];
+        let err = VarLong::decode(&mut buf).unwrap_err();
+        assert!(err.is_fatal());
+    }
+
+    #[test]
+    fn test_i64_max_is_10_bytes() {
+        let mut buf = Vec::new();
+        VarLong(i64::MAX).encode(&mut buf).unwrap();
+        assert_eq!(buf.len(), 9);
+    }
+
+    #[test]
+    fn test_varlong_decode_incomplete() {
+        let mut buf: &[u8] = &[0x80, 0x80];
+        let err = VarLong::decode(&mut buf).unwrap_err();
+        assert!(err.is_incomplete());
+    }
+
+    #[test]
+    fn test_varlong_round_trip_zero() {
+        let vl = VarLong(0);
+        let mut buf = Vec::new();
+        vl.encode(&mut buf).unwrap();
+        assert_eq!(buf, [0x00]);
+        let mut slice: &[u8] = &buf;
+        assert_eq!(VarLong::decode(&mut slice).unwrap(), vl);
+    }
+
+    #[test]
+    fn test_varlong_max_is_not_11_bytes() {
+        let mut buf = Vec::new();
+        VarLong(i64::MIN).encode(&mut buf).unwrap();
+        assert_eq!(buf.len(), 10);
+        assert_eq!(VarLong(i64::MIN).written_size(), 10);
+    }
+
+    #[test]
+    fn test_from_i64_conversion() {
+        assert_eq!(VarLong::from(42i64).0, 42);
+        assert_eq!(i64::from(VarLong(42)), 42);
+    }
+}

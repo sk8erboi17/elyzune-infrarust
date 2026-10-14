@@ -1,0 +1,40 @@
+[package]
+name = "infrarust_protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT"
+repository.workspace = true
+description = "Minecraft protocol codec for the Infrarust proxy"
+readme = "README.md"
+keywords = ["minecraft", "protocol", "codec", "nbt"]
+categories = ["game-development", "network-programming", "parser-implementations"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
+
+[features]
+default = []
+libdeflater = ["dep:libdeflater"]
+
+[dependencies]
+thiserror = { workspace = true }
+uuid = { workspace = true }
+bytes = { workspace = true }
+flate2 = { workspace = true }
+libdeflater = { workspace = true, optional = true }
+aes = { workspace = true }
+cfb8 = { workspace = true }
+cipher = { workspace = true }
+
+[dev-dependencies]
+divan = { workspace = true }
+proptest = "1.11.0"
+
+[[bench]]
+name = "frame_codec"
+harness = false

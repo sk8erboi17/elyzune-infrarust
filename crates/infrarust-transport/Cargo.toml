@@ -1,0 +1,41 @@
+[package]
+name = "infrarust-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+description = "Low-level networking layer for the Infrarust Minecraft proxy"
+readme = "README.md"
+keywords = ["minecraft", "proxy", "tcp", "proxy-protocol"]
+categories = ["game-development", "network-programming"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+bytes = { workspace = true }
+socket2 = { workspace = true }
+ppp = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+infrarust_config = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { workspace = true }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+listenfd = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dev-dependencies]
+command-fds = { workspace = true }
+rusty-fork = { workspace = true }

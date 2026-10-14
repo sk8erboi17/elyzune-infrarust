@@ -1,0 +1,384 @@
+use crate::codec::{McBufReadExt, McBufWriteExt, VarInt};
+use crate::error::ProtocolResult;
+use crate::packets::play::common::{read_text_component, write_text_component};
+use crate::packets::{Packet, PacketMapping};
+use crate::version::{ConnectionState, Direction, ProtocolVersion};
+
+define_twin_packets! {
+    packets: {
+        CSetTitle: Clientbound = ids![
+            V1_17   => 0x59,
+            V1_18   => 0x5A,
+            V1_19_1 => 0x5D,
+            V1_19_3 => 0x5B,
+            V1_19_4 => 0x5F,
+            V1_20_2 => 0x61,
+            V1_20_3 => 0x63,
+            V1_20_5 => 0x65,
+            V1_21_2 => 0x6C,
+            V1_21_5 => 0x6B,
+            V1_21_9 => 0x70,
+            V26_1   => 0x72,
+            V26_3   => 0x74,
+        ],
+        CSetSubtitle: Clientbound = ids![
+            V1_17   => 0x57,
+            V1_18   => 0x58,
+            V1_19_1 => 0x5B,
+            V1_19_3 => 0x59,
+            V1_19_4 => 0x5D,
+            V1_20_2 => 0x5F,
+            V1_20_3 => 0x61,
+            V1_20_5 => 0x63,
+            V1_21_2 => 0x6A,
+            V1_21_5 => 0x69,
+            V1_21_9 => 0x6E,
+            V26_1   => 0x70,
+            V26_3   => 0x72,
+        ],
+    },
+    state: ConnectionState::Play,
+    encode_only: true,
+    fields: {
+        pub text: Vec<u8>,
+    },
+    shared_impl: {
+        pub fn from_json(json: &str) -> Self {
+            Self {
+                text: json.as_bytes().to_vec(),
+            }
+        }
+
+        pub fn from_nbt(nbt: Vec<u8>) -> Self {
+            Self { text: nbt }
+        }
+    },
+    decode(r, version): {
+        let text = read_text_component(r, version, 0, Self::NAME)?;
+        Ok(Self { text })
+    },
+    encode(self, w, version): {
+        write_text_component(w, &self.text, version, Self::NAME, "text")
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct CSetTitleTimes {
+    pub fade_in: i32,
+    pub stay: i32,
+    pub fade_out: i32,
+}
+
+impl Packet for CSetTitleTimes {
+    const NAME: &'static str = "CSetTitleTimes";
+
+    const STATE: ConnectionState = ConnectionState::Play;
+    const DIRECTION: Direction = Direction::Clientbound;
+    const ENCODE_ONLY: bool = true;
+    const IDS: &'static [PacketMapping] = ids![
+        V1_17   => 0x5A,
+        V1_18   => 0x5B,
+        V1_19_1 => 0x5E,
+        V1_19_3 => 0x5C,
+        V1_19_4 => 0x60,
+        V1_20_2 => 0x62,
+        V1_20_3 => 0x64,
+        V1_20_5 => 0x66,
+        V1_21_2 => 0x6D,
+        V1_21_5 => 0x6C,
+        V1_21_9 => 0x71,
+        V26_1   => 0x73,
+        V26_3   => 0x75,
+    ];
+
+    fn decode(r: &mut &[u8], _version: ProtocolVersion) -> ProtocolResult<Self> {
+        let fade_in = r.read_i32_be()?;
+        let stay = r.read_i32_be()?;
+        let fade_out = r.read_i32_be()?;
+        Ok(Self {
+            fade_in,
+            stay,
+            fade_out,
+        })
+    }
+
+    fn encode(
+        &self,
+        w: &mut (impl std::io::Write + ?Sized),
+        _version: ProtocolVersion,
+    ) -> ProtocolResult<()> {
+        w.write_i32_be(self.fade_in)?;
+        w.write_i32_be(self.stay)?;
+        w.write_i32_be(self.fade_out)?;
+        Ok(())
+    }
+}
+
+const TITLE_ACTION_BAR_ADDED: ProtocolVersion = ProtocolVersion(315);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CTitleLegacy {
+    SetTitle(String),
+    SetSubtitle(String),
+    SetTimes {
+        fade_in: i32,
+        stay: i32,
+        fade_out: i32,
+    },
+    Hide,
+    Reset,
+}
+
+impl CTitleLegacy {
+    fn shift(version: ProtocolVersion) -> i32 {
+        i32::from(version.no_less_than(TITLE_ACTION_BAR_ADDED))
+    }
+
+    fn action_id(&self, version: ProtocolVersion) -> i32 {
+        match self {
+            Self::SetTitle(_) => 0,
+            Self::SetSubtitle(_) => 1,
+            Self::SetTimes { .. } => 2 + Self::shift(version),
+            Self::Hide => 3 + Self::shift(version),
+            Self::Reset => 4 + Self::shift(version),
+        }
+    }
+}
+
+impl Packet for CTitleLegacy {
+    const NAME: &'static str = "CTitleLegacy";
+
+    const STATE: ConnectionState = ConnectionState::Play;
+    const DIRECTION: Direction = Direction::Clientbound;
+    const ENCODE_ONLY: bool = true;
+    const IDS: &'static [PacketMapping] = ids![
+        V1_8               => 0x45,
+        V1_12              => 0x47,
+        V1_12_1            => 0x48,
+        V1_13              => 0x4B,
+        V1_14              => 0x4F,
+        V1_15              => 0x50,
+        V1_16 ..= V1_16_4  => 0x4F,
+    ];
+
+    fn decode(r: &mut &[u8], version: ProtocolVersion) -> ProtocolResult<Self> {
+        let action = r.read_var_int()?.0;
+        let shift = Self::shift(version);
+
+        if action == 0 {
+            Ok(Self::SetTitle(r.read_string()?))
+        } else if action == 1 {
+            Ok(Self::SetSubtitle(r.read_string()?))
+        } else if action == 2 + shift {
+            let fade_in = r.read_i32_be()?;
+            let stay = r.read_i32_be()?;
+            let fade_out = r.read_i32_be()?;
+            Ok(Self::SetTimes {
+                fade_in,
+                stay,
+                fade_out,
+            })
+        } else if action == 3 + shift {
+            Ok(Self::Hide)
+        } else if action == 4 + shift {
+            Ok(Self::Reset)
+        } else {
+            Err(crate::error::ProtocolError::invalid(format!(
+                "CTitleLegacy: unknown action {action}"
+            )))
+        }
+    }
+
+    fn encode(
+        &self,
+        w: &mut (impl std::io::Write + ?Sized),
+        version: ProtocolVersion,
+    ) -> ProtocolResult<()> {
+        w.write_var_int(&VarInt(self.action_id(version)))?;
+        match self {
+            Self::SetTitle(json) | Self::SetSubtitle(json) => {
+                w.write_string(json)?;
+            }
+            Self::SetTimes {
+                fade_in,
+                stay,
+                fade_out,
+            } => {
+                w.write_i32_be(*fade_in)?;
+                w.write_i32_be(*stay)?;
+                w.write_i32_be(*fade_out)?;
+            }
+            Self::Hide | Self::Reset => {}
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CClearTitles {
+    pub reset: bool,
+}
+
+impl Packet for CClearTitles {
+    const NAME: &'static str = "CClearTitles";
+
+    const STATE: ConnectionState = ConnectionState::Play;
+    const DIRECTION: Direction = Direction::Clientbound;
+    const ENCODE_ONLY: bool = true;
+    const IDS: &'static [PacketMapping] = ids![
+        V1_17   => 0x10,
+        V1_19   => 0x0D,
+        V1_19_3 => 0x0C,
+        V1_19_4 => 0x0E,
+        V1_20_2 => 0x0F,
+        V1_21_5 => 0x0E,
+    ];
+
+    fn decode(r: &mut &[u8], _version: ProtocolVersion) -> ProtocolResult<Self> {
+        Ok(Self {
+            reset: r.read_bool()?,
+        })
+    }
+
+    fn encode(
+        &self,
+        w: &mut (impl std::io::Write + ?Sized),
+        _version: ProtocolVersion,
+    ) -> ProtocolResult<()> {
+        w.write_bool(self.reset)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use crate::packets::round_trip;
+
+    #[test]
+    fn test_title_round_trip_json() {
+        let pkt = CSetTitle::from_json(r#"{"text":"Welcome!"}"#);
+        let decoded = round_trip(&pkt, ProtocolVersion::V1_19);
+        assert_eq!(
+            std::str::from_utf8(&decoded.text).unwrap(),
+            r#"{"text":"Welcome!"}"#
+        );
+    }
+
+    #[test]
+    fn test_subtitle_round_trip_json() {
+        let pkt = CSetSubtitle::from_json(r#"{"text":"Enjoy your stay"}"#);
+        let decoded = round_trip(&pkt, ProtocolVersion::V1_19);
+        assert_eq!(
+            std::str::from_utf8(&decoded.text).unwrap(),
+            r#"{"text":"Enjoy your stay"}"#
+        );
+    }
+
+    #[test]
+    fn test_title_times_round_trip() {
+        let pkt = CSetTitleTimes {
+            fade_in: 10,
+            stay: 70,
+            fade_out: 20,
+        };
+        let decoded = round_trip(&pkt, ProtocolVersion::V1_21);
+        assert_eq!(decoded.fade_in, 10);
+        assert_eq!(decoded.stay, 70);
+        assert_eq!(decoded.fade_out, 20);
+    }
+
+    #[test]
+    fn test_legacy_title_set_title() {
+        let pkt = CTitleLegacy::SetTitle(r#"{"text":"Welcome!"}"#.to_string());
+        let decoded = round_trip(&pkt, ProtocolVersion::V1_12);
+        match decoded {
+            CTitleLegacy::SetTitle(text) => assert_eq!(text, r#"{"text":"Welcome!"}"#),
+            _ => panic!("expected SetTitle"),
+        }
+    }
+
+    #[test]
+    fn test_legacy_title_set_subtitle() {
+        let pkt = CTitleLegacy::SetSubtitle(r#"{"text":"Sub"}"#.to_string());
+        let decoded = round_trip(&pkt, ProtocolVersion::V1_14);
+        match decoded {
+            CTitleLegacy::SetSubtitle(text) => assert_eq!(text, r#"{"text":"Sub"}"#),
+            _ => panic!("expected SetSubtitle"),
+        }
+    }
+
+    #[test]
+    fn test_legacy_title_set_times_post_1_11() {
+        let pkt = CTitleLegacy::SetTimes {
+            fade_in: 10,
+            stay: 70,
+            fade_out: 20,
+        };
+        let decoded = round_trip(&pkt, ProtocolVersion::V1_12);
+        match decoded {
+            CTitleLegacy::SetTimes {
+                fade_in,
+                stay,
+                fade_out,
+            } => {
+                assert_eq!(fade_in, 10);
+                assert_eq!(stay, 70);
+                assert_eq!(fade_out, 20);
+            }
+            _ => panic!("expected SetTimes"),
+        }
+    }
+
+    #[test]
+    fn test_legacy_title_hide_and_reset_follow_the_action_bar_shift() {
+        for version in [ProtocolVersion::V1_8, ProtocolVersion::V1_12_2] {
+            assert_eq!(round_trip(&CTitleLegacy::Hide, version), CTitleLegacy::Hide);
+            assert_eq!(
+                round_trip(&CTitleLegacy::Reset, version),
+                CTitleLegacy::Reset
+            );
+        }
+        let mut buf = Vec::new();
+        CTitleLegacy::Reset
+            .encode(&mut buf, ProtocolVersion::V1_9_4)
+            .unwrap();
+        assert_eq!(buf, [4]);
+        buf.clear();
+        CTitleLegacy::Reset
+            .encode(&mut buf, ProtocolVersion::V1_12_2)
+            .unwrap();
+        assert_eq!(buf, [5]);
+    }
+
+    #[test]
+    fn test_clear_titles_round_trip() {
+        for reset in [true, false] {
+            let decoded = round_trip(&CClearTitles { reset }, ProtocolVersion::V1_21);
+            assert_eq!(decoded.reset, reset);
+        }
+    }
+
+    #[test]
+    fn test_legacy_title_set_times_pre_1_11() {
+        let pkt = CTitleLegacy::SetTimes {
+            fade_in: 5,
+            stay: 40,
+            fade_out: 10,
+        };
+        let decoded = round_trip(&pkt, ProtocolVersion::V1_9);
+        match decoded {
+            CTitleLegacy::SetTimes {
+                fade_in,
+                stay,
+                fade_out,
+            } => {
+                assert_eq!(fade_in, 5);
+                assert_eq!(stay, 40);
+                assert_eq!(fade_out, 10);
+            }
+            _ => panic!("expected SetTimes"),
+        }
+    }
+}

@@ -1,0 +1,255 @@
+use crate::codec::{McBufReadExt, McBufWriteExt, VarInt};
+use crate::error::ProtocolResult;
+use crate::packets::{Packet, PacketMapping};
+use crate::version::{ConnectionState, Direction, ProtocolVersion};
+
+#[derive(Debug, Clone)]
+pub struct CRespawn {
+    pub dimension: i32,
+    pub dimension_type: String,
+    pub level_name: String,
+    pub hashed_seed: i64,
+    pub gamemode: u8,
+    pub previous_gamemode: i8,
+    pub is_debug: bool,
+    pub is_flat: bool,
+    pub data_to_keep: u8,
+    pub death_dimension: Option<String>,
+    pub death_position: Option<i64>,
+    pub portal_cooldown: i32,
+    pub sea_level: i32,
+    pub raw_payload: Option<Vec<u8>>,
+}
+
+impl Default for CRespawn {
+    fn default() -> Self {
+        Self {
+            dimension: 0,
+            dimension_type: String::new(),
+            level_name: String::new(),
+            hashed_seed: 0,
+
+            gamemode: 0,
+            previous_gamemode: -1,
+            is_debug: false,
+            is_flat: false,
+            data_to_keep: 0,
+            death_dimension: None,
+            death_position: None,
+            portal_cooldown: 0,
+            sea_level: 63,
+            raw_payload: None,
+        }
+    }
+}
+
+impl Packet for CRespawn {
+    const NAME: &'static str = "CRespawn";
+
+    const STATE: ConnectionState = ConnectionState::Play;
+    const DIRECTION: Direction = Direction::Clientbound;
+    const ENCODE_ONLY: bool = true;
+    const IDS: &'static [PacketMapping] = ids![
+        V1_7_2  => 0x07,
+        V1_9    => 0x33,
+        V1_12   => 0x34,
+        V1_12_1 => 0x35,
+        V1_13   => 0x38,
+        V1_14   => 0x3A,
+        V1_15   => 0x3B,
+        V1_16   => 0x3A,
+        V1_16_2 => 0x39,
+        V1_17   => 0x3D,
+        V1_19   => 0x3B,
+        V1_19_1 => 0x3E,
+        V1_19_3 => 0x3D,
+        V1_19_4 => 0x41,
+        V1_20_2 => 0x43,
+        V1_20_3 => 0x45,
+        V1_20_5 => 0x47,
+        V1_21_2 => 0x4C,
+        V1_21_5 => 0x4B,
+        V1_21_9 => 0x50,
+        V26_1   => 0x52,
+        V26_3   => 0x54,
+    ];
+
+    fn decode(r: &mut &[u8], version: ProtocolVersion) -> ProtocolResult<Self> {
+        if version.less_than(ProtocolVersion::V1_20_2) {
+            let raw_payload = r.read_remaining()?;
+            Ok(Self {
+                raw_payload: Some(raw_payload),
+                ..Default::default()
+            })
+        } else {
+            decode_1_20_2_up(r, version)
+        }
+    }
+
+    fn encode(
+        &self,
+        w: &mut (impl std::io::Write + ?Sized),
+        version: ProtocolVersion,
+    ) -> ProtocolResult<()> {
+        if let Some(raw) = &self.raw_payload {
+            w.write_all(raw)?;
+            return Ok(());
+        }
+        encode_1_20_2_up(self, w, version)
+    }
+}
+
+fn decode_1_20_2_up(r: &mut &[u8], version: ProtocolVersion) -> ProtocolResult<CRespawn> {
+    let (dimension, dimension_type) = if version.no_less_than(ProtocolVersion::V1_20_5) {
+        (r.read_var_int()?.0, String::new())
+    } else {
+        (0, r.read_string()?)
+    };
+
+    let level_name = r.read_string()?;
+    let hashed_seed = r.read_i64_be()?;
+    let (gamemode, previous_gamemode) = super::common::decode_game_modes(r, version)?;
+    let is_debug = r.read_bool()?;
+    let is_flat = r.read_bool()?;
+
+    let (death_dimension, death_position) = super::common::decode_death_location(r)?;
+    let (portal_cooldown, sea_level) = super::common::decode_world_info(r, version)?;
+
+    let data_to_keep = r.read_u8()?;
+
+    Ok(CRespawn {
+        dimension,
+        dimension_type,
+        level_name,
+        hashed_seed,
+        gamemode,
+        previous_gamemode,
+        is_debug,
+        is_flat,
+        data_to_keep,
+        death_dimension,
+        death_position,
+        portal_cooldown,
+        sea_level,
+        raw_payload: None,
+    })
+}
+
+fn encode_1_20_2_up(
+    pkt: &CRespawn,
+    w: &mut (impl std::io::Write + ?Sized),
+    version: ProtocolVersion,
+) -> ProtocolResult<()> {
+    if version.no_less_than(ProtocolVersion::V1_20_5) {
+        w.write_var_int(&VarInt(pkt.dimension))?;
+    } else {
+        w.write_string(&pkt.dimension_type)?;
+    }
+
+    w.write_string(&pkt.level_name)?;
+    w.write_i64_be(pkt.hashed_seed)?;
+    super::common::encode_game_modes(w, pkt.gamemode, pkt.previous_gamemode, version)?;
+    w.write_bool(pkt.is_debug)?;
+    w.write_bool(pkt.is_flat)?;
+
+    super::common::encode_death_location(w, pkt.death_dimension.as_deref(), pkt.death_position)?;
+    super::common::encode_world_info(w, pkt.portal_cooldown, pkt.sea_level, version)?;
+
+    w.write_u8(pkt.data_to_keep)?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use crate::packets::round_trip;
+
+    #[test]
+    fn test_respawn_round_trip() {
+        let pkt = CRespawn {
+            dimension: 1,
+            dimension_type: "minecraft:the_nether".to_string(),
+            level_name: "minecraft:the_nether".to_string(),
+            hashed_seed: 987_654_321,
+            gamemode: 0,
+            previous_gamemode: 1,
+            is_debug: false,
+            is_flat: false,
+            data_to_keep: 0x03,
+            death_dimension: None,
+            death_position: None,
+            portal_cooldown: 0,
+            sea_level: 63,
+            raw_payload: None,
+        };
+        let decoded = round_trip(&pkt, ProtocolVersion::V1_21);
+        assert_eq!(decoded.dimension, 1);
+        assert_eq!(decoded.level_name, "minecraft:the_nether");
+        assert_eq!(decoded.hashed_seed, 987_654_321);
+        assert_eq!(decoded.gamemode, 0);
+        assert_eq!(decoded.previous_gamemode, 1);
+        assert_eq!(decoded.data_to_keep, 0x03);
+    }
+
+    #[test]
+    fn test_respawn_with_death_location() {
+        let pkt = CRespawn {
+            dimension: 0,
+            dimension_type: "minecraft:overworld".to_string(),
+            level_name: "minecraft:overworld".to_string(),
+            hashed_seed: 0,
+            gamemode: 0,
+            previous_gamemode: -1,
+            is_debug: false,
+            is_flat: false,
+            data_to_keep: 0,
+            death_dimension: Some("minecraft:overworld".to_string()),
+            death_position: Some(12_345_678),
+            portal_cooldown: 10,
+            sea_level: 63,
+            raw_payload: None,
+        };
+        let decoded = round_trip(&pkt, ProtocolVersion::V1_20_5);
+        assert_eq!(
+            decoded.death_dimension.as_deref(),
+            Some("minecraft:overworld")
+        );
+        assert_eq!(decoded.death_position, Some(12_345_678));
+        assert_eq!(decoded.portal_cooldown, 10);
+    }
+
+    #[test]
+    fn test_respawn_opaque_pre_1_20_2() {
+        let raw = vec![0xAA, 0xBB, 0xCC, 0xDD];
+        let pkt = CRespawn {
+            raw_payload: Some(raw.clone()),
+            ..Default::default()
+        };
+
+        let mut buf = Vec::new();
+        pkt.encode(&mut buf, ProtocolVersion::V1_19).unwrap();
+        let decoded = CRespawn::decode(&mut buf.as_slice(), ProtocolVersion::V1_19).unwrap();
+        assert_eq!(decoded.raw_payload, Some(raw));
+    }
+
+    #[test]
+    fn test_respawn_keeps_custom_dimension_type_below_1_20_5() {
+        for version in [ProtocolVersion::V1_20_2, ProtocolVersion::V1_20_3] {
+            let pkt = CRespawn {
+                level_name: "world_nether".to_string(),
+                dimension_type: "minecraft:the_nether".to_string(),
+                ..Default::default()
+            };
+            let mut first = Vec::new();
+            pkt.encode(&mut first, version).unwrap();
+            let decoded = CRespawn::decode(&mut first.as_slice(), version).unwrap();
+            assert_eq!(decoded.dimension_type, "minecraft:the_nether", "{version}");
+            assert_eq!(decoded.level_name, "world_nether", "{version}");
+            let mut second = Vec::new();
+            decoded.encode(&mut second, version).unwrap();
+            assert_eq!(first, second, "{version}");
+        }
+    }
+}

@@ -1,0 +1,169 @@
+name: Release Build
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  check-release:
+    runs-on: ubuntu-latest
+    if: startsWith(github.event.head_commit.message, 'MAJOR') ||startsWith(github.event.head_commit.message, 'MINOR') || startsWith(github.event.head_commit.message, 'PATCH')
+    outputs:
+      version: ${{ steps.get-version.outputs.version }}
+      commit_title: ${{ steps.get-commit-title.outputs.commit_title }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      
+      - name: Get version from Cargo.toml
+        id: get-version
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | cut -d'"' -f2)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Get commit Title without MAJOR/MINOR/PATCH
+        id: get-commit-title
+        run: |
+          COMMIT_TITLE=$(git log -1 --pretty=%B | head -n 1 | sed -E 's/^(MAJOR|MINOR|PATCH)[[:space:]]*:[[:space:]]*//') 
+          echo "commit_title=${COMMIT_TITLE}" >> $GITHUB_OUTPUT
+          
+      - name: Create tag
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git tag "v${{ steps.get-version.outputs.version }}"
+          git push origin "v${{ steps.get-version.outputs.version }}"
+
+  build-and-release:
+    needs: check-release
+    strategy:
+      matrix:
+        include:
+          # Linux builds - using musl for all Linux targets
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            arch: x86_64
+            platform: linux
+            ext: tar.gz
+          
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            arch: arm64
+            platform: linux
+            ext: tar.gz
+
+          # macOS builds
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            arch: x86_64
+            platform: darwin
+            ext: tar.gz
+
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            arch: arm64
+            platform: darwin
+            ext: tar.gz
+          
+          # Windows builds
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            arch: x86_64
+            platform: windows
+            ext: zip
+
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            arch: arm64
+            platform: windows
+            ext: zip
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          targets: ${{ matrix.target }}
+      
+      - name: Install Linux dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev musl-tools
+
+      - name: Build Admin Frontend
+        uses: ./.github/actions/build-frontend
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+        
+      - name: Prepare release archive (Unix)
+        if: matrix.platform != 'windows'
+        run: |
+          mkdir release
+          cp target/${{ matrix.target }}/release/infrarust release/
+          cd release
+          tar czf ../infrarust-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz *
+          cd ..
+
+      - name: Prepare release archive (Windows)
+        if: matrix.platform == 'windows'
+        run: |
+          mkdir release
+          cp target/${{ matrix.target }}/release/infrarust.exe release/
+          cd release
+          7z a ../infrarust-${{ matrix.platform }}-${{ matrix.arch }}.zip *
+          cd ..
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v3.0.3
+        with:
+          tag_name: v${{ needs.check-release.outputs.version }}
+          name: v${{ needs.check-release.outputs.version }} - ${{ needs.check-release.outputs.commit_title }} 
+          files: infrarust-${{ matrix.platform }}-${{ matrix.arch }}.${{ matrix.ext }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  docker:
+    needs: check-release
+    uses: ./.github/workflows/docker-build.yml
+    secrets: inherit
+    with:
+      tag: ${{ needs.check-release.outputs.version }},latest
+
+  crate-publish:
+    continue-on-error: true
+    needs: check-release
+    runs-on: ubuntu-latest
+    steps:
+        - uses: actions/checkout@v7.0.1
+          with:
+            ref: v${{ needs.check-release.outputs.version}}
+          
+        - name: Install Rust
+          uses: dtolnay/rust-toolchain@1.99.0
+
+        - name: Build Admin Frontend
+          uses: ./.github/actions/build-frontend
+
+        - name: Install cargo-workspaces
+          uses: taiki-e/install-action@v2.87.21
+          with:
+            tool: cargo-workspaces
+          
+        - name: Publish to crates.io
+          env:
+            CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          run: cargo workspaces publish --from-git --yes
+    
+  pterodactyl-egg:
+    needs: build-and-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Repository Dispatch
+        uses: peter-evans/repository-dispatch@v4.0.1
+        with:
+          token: ${{ secrets.INFRARUST_EGG_REPO_PAT }}
+          repository: shadowner/infrarust-egg
+          event-type: infrarust-released

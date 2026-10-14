@@ -1,0 +1,430 @@
+//! Player lifecycle events.
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use crate::event::Event;
+use crate::permissions::PermissionChecker;
+use crate::player::Player;
+use crate::types::{Component, GameProfile, ProtocolVersion, ServerId};
+
+/// Fired before authentication, when a player initiates a connection.
+///
+/// Listeners can deny the connection, force offline/online mode, or
+/// let it proceed normally.
+pub struct PreLoginEvent {
+    /// The player's game profile (may be incomplete in offline mode).
+    pub profile: GameProfile,
+    /// The remote address of the connecting client.
+    pub remote_addr: SocketAddr,
+    /// The protocol version reported by the client.
+    pub protocol_version: ProtocolVersion,
+    /// The server domain the client connected to (from the handshake).
+    pub server_domain: String,
+    result: PreLoginResult,
+}
+
+impl PreLoginEvent {
+    pub fn new(
+        profile: GameProfile,
+        remote_addr: SocketAddr,
+        protocol_version: ProtocolVersion,
+        server_domain: String,
+    ) -> Self {
+        Self {
+            profile,
+            remote_addr,
+            protocol_version,
+            server_domain,
+            result: PreLoginResult::default(),
+        }
+    }
+
+    /// Shortcut: deny the login with a reason message.
+    pub fn deny(&mut self, reason: Component) {
+        self.result = PreLoginResult::Denied { reason };
+    }
+}
+
+/// The result of a [`PreLoginEvent`].
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub enum PreLoginResult {
+    /// Allow the login to proceed normally.
+    #[default]
+    Allowed,
+    /// Deny the login with a kick reason.
+    Denied {
+        /// The reason shown to the player.
+        reason: Component,
+    },
+    /// Force offline-mode authentication for this player.
+    ForceOffline,
+    /// Force online-mode authentication for this player.
+    ForceOnline,
+}
+
+crate::event::resulted_event!(PreLoginEvent, PreLoginResult);
+
+#[non_exhaustive]
+pub struct GameProfileRequestEvent {
+    pub profile: GameProfile,
+    pub online_mode: bool,
+    pub remote_addr: SocketAddr,
+    pub virtual_host: Option<String>,
+    pub protocol_version: ProtocolVersion,
+    original: GameProfile,
+    denied: Option<Component>,
+}
+
+impl GameProfileRequestEvent {
+    pub fn new(
+        profile: GameProfile,
+        online_mode: bool,
+        remote_addr: SocketAddr,
+        virtual_host: Option<String>,
+        protocol_version: ProtocolVersion,
+    ) -> Self {
+        Self {
+            original: profile.clone(),
+            profile,
+            online_mode,
+            remote_addr,
+            virtual_host,
+            protocol_version,
+            denied: None,
+        }
+    }
+
+    pub const fn original(&self) -> &GameProfile {
+        &self.original
+    }
+
+    pub fn deny(&mut self, reason: Component) {
+        self.denied = Some(reason);
+    }
+
+    pub fn allow(&mut self) {
+        self.denied = None;
+    }
+
+    pub const fn denied(&self) -> Option<&Component> {
+        self.denied.as_ref()
+    }
+
+    pub fn is_modified(&self) -> bool {
+        self.profile != self.original
+    }
+}
+
+impl Event for GameProfileRequestEvent {}
+
+/// Fired after a player has successfully authenticated.
+///
+/// This is informational — the login cannot be cancelled at this point.
+#[non_exhaustive]
+pub struct PostLoginEvent {
+    pub player: Arc<dyn Player>,
+    pub profile: GameProfile,
+    pub protocol_version: ProtocolVersion,
+}
+
+impl PostLoginEvent {
+    pub fn new(player: Arc<dyn Player>) -> Self {
+        Self {
+            profile: player.profile().clone(),
+            protocol_version: player.protocol_version(),
+            player,
+        }
+    }
+}
+
+crate::events::player_event!(PostLoginEvent);
+
+impl Event for PostLoginEvent {}
+
+/// Fired when a player disconnects from the proxy.
+///
+/// This event is **awaited** — the proxy waits for all listeners to finish
+/// before cleaning up resources, allowing plugins to do cleanup work.
+#[non_exhaustive]
+pub struct DisconnectEvent {
+    pub player: Arc<dyn Player>,
+    pub last_server: Option<ServerId>,
+    pub cause: DisconnectCause,
+}
+
+impl DisconnectEvent {
+    pub fn new(
+        player: Arc<dyn Player>,
+        last_server: Option<ServerId>,
+        cause: DisconnectCause,
+    ) -> Self {
+        Self {
+            player,
+            last_server,
+            cause,
+        }
+    }
+
+    pub fn username(&self) -> &str {
+        &self.player.profile().username
+    }
+}
+
+crate::events::player_event!(DisconnectEvent);
+
+impl Event for DisconnectEvent {}
+
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum DisconnectCause {
+    ClientQuit,
+    Kicked { reason: Option<Component> },
+    BackendClosed { reason: Option<Component> },
+    Shutdown,
+    Error,
+}
+
+impl DisconnectCause {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::ClientQuit => "client_quit",
+            Self::Kicked { .. } => "kicked",
+            Self::BackendClosed { .. } => "backend_closed",
+            Self::Shutdown => "shutdown",
+            Self::Error => "error",
+        }
+    }
+
+    pub const fn reason(&self) -> Option<&Component> {
+        match self {
+            Self::Kicked { reason } | Self::BackendClosed { reason } => reason.as_ref(),
+            Self::ClientQuit | Self::Shutdown | Self::Error => None,
+        }
+    }
+}
+
+/// Fired when online-mode authentication fails (cracked client couldn't complete encryption).
+///
+/// Covers both forced online auth (`ForceOnline` in offline mode) and default
+/// online auth (`client_only` mode). Plugins can listen for this to remember
+/// the username and set `ForceOffline` on the next connection attempt.
+#[non_exhaustive]
+pub struct OnlineAuthFailedEvent {
+    /// The username that failed online authentication.
+    pub username: String,
+}
+
+impl OnlineAuthFailedEvent {
+    pub fn new(username: impl Into<String>) -> Self {
+        Self {
+            username: username.into(),
+        }
+    }
+}
+
+impl Event for OnlineAuthFailedEvent {}
+
+/// Fired after authentication, once the active permission provider has built
+/// the player's checker.
+///
+/// A listener can set a custom [`PermissionChecker`] that replaces the
+/// provider's checker for this player only. To answer for every player, a
+/// plugin registers a [`PermissionProvider`](crate::permissions::PermissionProvider)
+/// instead.
+///
+/// If no listener sets a custom checker, the player keeps the checker built by
+/// the provider selected with `[permissions] provider`.
+pub struct PermissionsSetupEvent {
+    pub player: Arc<dyn Player>,
+    pub online_mode: bool,
+    result: PermissionsSetupResult,
+}
+
+/// The result of a [`PermissionsSetupEvent`].
+#[derive(Default)]
+#[non_exhaustive]
+pub enum PermissionsSetupResult {
+    /// Keep the checker built by the active permission provider.
+    #[default]
+    UseDefault,
+    /// Use a plugin-provided permission checker.
+    Custom(Arc<dyn PermissionChecker>),
+}
+
+impl PermissionsSetupEvent {
+    pub fn new(player: Arc<dyn Player>, online_mode: bool) -> Self {
+        Self {
+            player,
+            online_mode,
+            result: PermissionsSetupResult::default(),
+        }
+    }
+}
+
+crate::events::player_event!(PermissionsSetupEvent, profile);
+
+crate::event::resulted_event!(PermissionsSetupEvent, PermissionsSetupResult);
+
+pub struct LoginEvent {
+    pub player: Arc<dyn Player>,
+    pub online_mode: bool,
+    result: LoginResult,
+}
+
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub enum LoginResult {
+    #[default]
+    Allowed,
+    Denied {
+        reason: Component,
+    },
+}
+
+impl LoginEvent {
+    pub fn new(player: Arc<dyn Player>, online_mode: bool) -> Self {
+        Self {
+            player,
+            online_mode,
+            result: LoginResult::default(),
+        }
+    }
+
+    pub fn deny(&mut self, reason: Component) {
+        self.result = LoginResult::Denied { reason };
+    }
+}
+
+crate::events::player_event!(LoginEvent, profile);
+
+crate::event::resulted_event!(LoginEvent, LoginResult);
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use crate::event::ResultedEvent;
+
+    #[test]
+    fn pre_login_default_result() {
+        let event = PreLoginEvent::new(
+            GameProfile {
+                uuid: uuid::Uuid::nil(),
+                username: "Steve".into(),
+                properties: vec![],
+            },
+            "127.0.0.1:25565".parse().unwrap(),
+            ProtocolVersion::MINECRAFT_1_21,
+            "play.example.com".into(),
+        );
+        assert!(matches!(event.result(), PreLoginResult::Allowed));
+    }
+
+    #[test]
+    fn pre_login_deny() {
+        let mut event = PreLoginEvent::new(
+            GameProfile {
+                uuid: uuid::Uuid::nil(),
+                username: "Steve".into(),
+                properties: vec![],
+            },
+            "127.0.0.1:25565".parse().unwrap(),
+            ProtocolVersion::MINECRAFT_1_21,
+            "play.example.com".into(),
+        );
+
+        event.deny(Component::error("Banned"));
+        assert!(matches!(event.result(), PreLoginResult::Denied { .. }));
+    }
+
+    #[test]
+    fn pre_login_set_result() {
+        let mut event = PreLoginEvent::new(
+            GameProfile {
+                uuid: uuid::Uuid::nil(),
+                username: "Steve".into(),
+                properties: vec![],
+            },
+            "127.0.0.1:25565".parse().unwrap(),
+            ProtocolVersion::MINECRAFT_1_21,
+            "play.example.com".into(),
+        );
+
+        event.set_result(PreLoginResult::ForceOffline);
+        assert!(matches!(event.result(), PreLoginResult::ForceOffline));
+    }
+
+    #[test]
+    fn game_profile_request_keeps_the_original_profile() {
+        let mut event = GameProfileRequestEvent::new(
+            GameProfile {
+                uuid: uuid::Uuid::nil(),
+                username: "Steve".into(),
+                properties: vec![],
+            },
+            false,
+            "127.0.0.1:25565".parse().unwrap(),
+            Some("play.example.com".into()),
+            ProtocolVersion::MINECRAFT_1_21,
+        );
+        assert!(!event.is_modified());
+
+        event.profile.username = "Alex".into();
+
+        assert!(event.is_modified());
+        assert_eq!(event.original().username, "Steve");
+        assert_eq!(event.profile.username, "Alex");
+    }
+
+    #[test]
+    fn game_profile_request_can_be_denied_and_allowed_again() {
+        let mut event = GameProfileRequestEvent::new(
+            GameProfile {
+                uuid: uuid::Uuid::nil(),
+                username: "Steve".into(),
+                properties: vec![],
+            },
+            true,
+            "127.0.0.1:25565".parse().unwrap(),
+            None,
+            ProtocolVersion::MINECRAFT_1_21,
+        );
+        assert_eq!(event.denied(), None);
+        event.deny(Component::text("closed"));
+        assert_eq!(event.denied(), Some(&Component::text("closed")));
+        event.allow();
+        assert_eq!(event.denied(), None);
+    }
+
+    #[test]
+    fn disconnect_cause_names_and_reasons() {
+        let kicked = DisconnectCause::Kicked {
+            reason: Some(Component::text("bye")),
+        };
+        assert_eq!(kicked.as_str(), "kicked");
+        assert_eq!(kicked.reason(), Some(&Component::text("bye")));
+        assert_eq!(DisconnectCause::ClientQuit.as_str(), "client_quit");
+        assert_eq!(DisconnectCause::ClientQuit.reason(), None);
+        assert_eq!(
+            DisconnectCause::BackendClosed { reason: None }.as_str(),
+            "backend_closed"
+        );
+        assert_eq!(DisconnectCause::Shutdown.as_str(), "shutdown");
+        assert_eq!(DisconnectCause::Error.as_str(), "error");
+    }
+
+    #[test]
+    fn non_exhaustive_result_match() {
+        let result = PreLoginResult::Allowed;
+        #[allow(unreachable_patterns)]
+        match result {
+            PreLoginResult::Allowed
+            | PreLoginResult::Denied { .. }
+            | PreLoginResult::ForceOffline
+            | PreLoginResult::ForceOnline
+            | _ => {}
+        }
+    }
+}

@@ -1,0 +1,52 @@
+# The Elyzune game route.
+#
+# ── How Infrarust reads servers_dir ──
+#
+# Every *.toml file in servers_dir is one route, one `ServerConfig`
+# (crates/infrarust_config/src/server.rs). The file name is the route's id;
+# `name`, when set, replaces it and is the id players are switched by. A client
+# is routed by the hostname it typed: an exact `domains` entry wins over a
+# wildcard, and a route with no domains is reachable only by a switch.
+#
+# ── This route ──
+#
+# `*` catches every hostname, as Velocity's `try = ["nosville"]` did: a player
+# typing the bare IP or an old address still lands in the game.
+#
+# `client_only`: Infrarust can authenticate with Mojang and logs into the
+# backend itself, so the backend runs offline and learns the player only from
+# the signed `velocity` forwarding (secret in ../infrarust.toml). The hybrid
+# login decides per name (elyzune-identity, ../plugins/elyzune_identity): a
+# name a paid account owns must pass Mojang, any other logs in offline and is
+# held by the game server until /register or /login. Never change this route
+# to `offline`: an offline route cannot ask Mojang, so a paid name could not
+# be proven and is refused there; every other player would still need a
+# password, but nothing would be gained. The offline route the bot tests use
+# exists only in their loopback fixture (tests/python/fixture.py).
+#
+# `addresses` is hyperion-proxy's player listener, which takes over Paper's
+# loopback port 25567 from velocity.toml `[servers]`. The game server sits
+# behind hyperion-proxy on its own port and is never addressed from here.
+#
+# ── More game-server processes, one per instance group ──
+#
+# Each Hyperion process gets its own hyperion-proxy and its own file next to
+# this one, with the same mode and forwarding and its own address:
+#
+#     name = "elyzune-<process>"      # [a-z0-9_-], at most 64 characters
+#     network = "elyzune"
+#     domains = []                    # reached by a switch, never by a hostname
+#     addresses = ["<that process's hyperion-proxy>"]
+#     proxy_mode = "client_only"
+#     forwarding_mode = "velocity"
+#
+# Routes in one `network` can move a player between them without a reconnect;
+# the destination backend sees a fresh login carrying the same signed identity
+# and verifies it like any other. Replicas of one process type are listed
+# together in a single file's `addresses` and spread by `balance`.
+name = "elyzune"
+network = "elyzune"
+domains = ["*"]
+addresses = ["127.0.0.1:25567"]
+proxy_mode = "client_only"
+forwarding_mode = "velocity"

@@ -1,0 +1,75 @@
+# Elyzune's public entry. Infrarust replaces Velocity and SkinsRestorer.
+#
+#   client ──TCP, Mojang login──▶ Infrarust (this file)
+#                                    │  Velocity modern forwarding, HMAC-signed
+#                                    ▼
+#                                 hyperion-proxy ──rkyv──▶ Hyperion game server
+#
+# The hybrid login (AGENTS.md, 13 October 2026) is decided here, by name,
+# before anything else (elyzune-identity): a name a paid Mojang account owns
+# runs the whole Mojang login on this proxy (proxy_mode = "client_only" in
+# servers/*.toml: encryption, the session-server check and the signed skin,
+# on proxy threads, never on the game tick); any other name logs in offline
+# and proves itself with a password on the game server. Either way Infrarust
+# logs into the backend in offline mode and answers the backend's
+# `velocity:player_info` query with the OfflinePlayer:<name> UUID, the name,
+# the `textures` and `elyzune:login` (mojang or password), signed with the
+# secret below. Hyperion refuses every login that does not carry that
+# signature (run/config.toml: [forwarding] mode = "velocity").
+#
+# Run as `infrarust --config infrarust.toml` from this directory: every
+# relative path below is resolved against the working directory.
+
+# The address Velocity binds today (velocity.toml `bind`), so the cutover
+# changes neither DNS nor the firewall. Infrarust is the only process that may
+# listen on a public address; hyperion-proxy and the game servers stay on
+# loopback or the private network.
+bind = "57.131.147.164:25566"
+
+# One route per *.toml file. servers/elyzune.toml documents the format and how
+# further game-server processes are added.
+servers_dir = "./servers"
+
+# Velocity's `compression-threshold`. Infrarust completes the login itself, so
+# the client link is its to compress; without this every chunk would cross the
+# internet uncompressed. The backend link is compressed by Hyperion on its own.
+compression_threshold = 256
+
+# Velocity's `login-ratelimit = 3000`: one login per address every three
+# seconds. Status pings keep Infrarust's own, more permissive limit.
+[rate_limit]
+enabled = true
+max_connections = 1
+window = "3s"
+
+[forwarding]
+mode = "velocity"
+# Host-owned, never committed and never part of a build: the same secret that
+# Hyperion's run/config.toml names in [forwarding] secret_file. Both sides trim
+# surrounding whitespace before keying the HMAC. When the file does not exist
+# Infrarust creates it (32 random alphanumerics, mode 0600); the game servers
+# must then be able to read it too, which is the deploy's job, not this file's.
+# If Infrarust cannot read it, it logs an error and forwards nothing, and every
+# Hyperion backend refuses every login: the failure is closed, not open.
+secret_file = "/etc/elyzune/forwarding.secret"
+
+[auth]
+# Mojang's session server, which is also the default: written out because it is
+# the reason this proxy exists. Loopback tests replace it with a stand-in.
+session_url = "https://sessionserver.mojang.com/session/minecraft/hasJoined"
+# The id an offline login gets before elyzune-identity sets it: the
+# name-based OfflinePlayer:<name> id, which every Elyzune player keeps.
+offline_uuid = "offline"
+
+# The texts this proxy shows players (kicks, refusals), Velocity's live texts
+# where Velocity had the same situation; see lang.toml.
+[messages]
+file = "lang.toml"
+language = "en"
+
+# Infrarust's own password plugin stays off: Elyzune's passwords live in the
+# game server (PostgreSQL, argon2id), and its proxy commands would shadow the
+# game's. elyzune-identity (plugins/elyzune_identity/config.toml) decides who
+# logs in with Mojang and who with a password.
+[plugins.auth]
+enabled = false
