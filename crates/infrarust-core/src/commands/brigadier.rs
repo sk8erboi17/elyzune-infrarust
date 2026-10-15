@@ -539,7 +539,7 @@ mod tests {
         inject_proxy_commands(
             &mut cmds,
             ProtocolVersion::V1_21,
-            &tree(&[&["hello", "hi", "p:hello"]]),
+            &tree(&[&["hello", "hi", "hello-alt"]]),
             None,
         )
         .unwrap();
@@ -548,7 +548,7 @@ mod tests {
         names.sort_unstable();
         assert_eq!(
             names,
-            ["gamemode", "hello", "hi", "infrarust", "ir", "p:hello"]
+            ["gamemode", "hello", "hello-alt", "hi", "infrarust", "ir"]
         );
     }
 
@@ -558,11 +558,11 @@ mod tests {
         inject_proxy_commands(
             &mut cmds,
             ProtocolVersion::V1_21,
-            &tree(&[&["hello", "hi", "p:hello"]]),
+            &tree(&[&["hello", "hi", "hello-alt"]]),
             None,
         )
         .unwrap();
-        let children: HashSet<Vec<i32>> = ["hello", "hi", "p:hello"]
+        let children: HashSet<Vec<i32>> = ["hello", "hi", "hello-alt"]
             .iter()
             .map(|label| {
                 cmds.nodes

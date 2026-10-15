@@ -83,7 +83,8 @@ struct Entry {
 }
 
 impl Entry {
-    fn namespaced(&self) -> Option<String> {
+    /// Internal ownership key; never a command label.
+    fn owned_key(&self) -> Option<String> {
         self.owner
             .as_deref()
             .map(|owner| namespaced(owner, &self.spec.name))
@@ -92,7 +93,6 @@ impl Entry {
     fn labels(&self) -> Vec<String> {
         let mut labels = vec![self.spec.name.clone()];
         labels.extend(self.spec.aliases.iter().cloned());
-        labels.extend(self.namespaced());
         labels
     }
 
@@ -227,7 +227,7 @@ impl CommandManagerImpl {
                 }
             }
 
-            for label in [&name, &key].into_iter().chain(&aliases) {
+            for label in std::iter::once(&name).chain(&aliases) {
                 table.labels.insert(label.clone(), key.clone());
             }
             let mut spec = spec;
@@ -250,8 +250,10 @@ impl CommandManagerImpl {
     pub fn unregister_owned(&self, owner: &str, name: &str) -> Result<String, CommandError> {
         let removed = {
             let mut table = self.write();
-            let key = match table.resolve(name) {
-                Some(entry) if entry.owner.as_deref() == Some(owner) => entry.namespaced(),
+            // The registration handle may name the internal key at unload;
+            // dispatch and completion resolve only the public label table.
+            let key = match table.resolve(name).or_else(|| table.commands.get(name)) {
+                Some(entry) if entry.owner.as_deref() == Some(owner) => entry.owned_key(),
                 _ => None,
             };
             key.filter(|key| table.remove(key).is_some())
@@ -282,9 +284,7 @@ impl CommandManagerImpl {
         let name = name.to_lowercase();
         self.read()
             .resolve(&name)
-            .filter(|entry| {
-                entry.spec.name == name || entry.namespaced().as_deref() == Some(name.as_str())
-            })
+            .filter(|entry| entry.spec.name == name)
             .map(Entry::info)
     }
 
@@ -315,7 +315,7 @@ impl CommandManagerImpl {
                 entry.owner.is_some() && source.is_some_and(|source| visible_to(entry, source))
             })
             .collect();
-        entries.sort_by_key(|entry| entry.namespaced());
+        entries.sort_by_key(|entry| entry.owned_key());
         ProxyTree {
             commands: entries.into_iter().map(Entry::labels).collect(),
             shadowed: table.labels.keys().cloned().collect(),
@@ -326,13 +326,43 @@ impl CommandManagerImpl {
         self.read().resolve(label).cloned()
     }
 
+    fn resolve_for(&self, label: &str, owner: Option<&str>) -> Option<Entry> {
+        match owner {
+            None => self.resolve(label),
+            Some(owner) => {
+                let name = normalize(label)?;
+                self.read().commands.get(&namespaced(owner, &name)).cloned()
+            }
+        }
+    }
+
     pub fn prepare(&self, source: CommandSource, input: &str) -> Prepared<Invocation> {
+        self.prepare_for(source, input, None)
+    }
+
+    /// The administrative plugin runner uses the internal owner key without
+    /// admitting that key as a label in client command packets.
+    pub fn prepare_owned(
+        &self,
+        source: CommandSource,
+        owner: &str,
+        input: &str,
+    ) -> Prepared<Invocation> {
+        self.prepare_for(source, input, Some(owner))
+    }
+
+    fn prepare_for(
+        &self,
+        source: CommandSource,
+        input: &str,
+        owner: Option<&str>,
+    ) -> Prepared<Invocation> {
         let input = input.trim();
         let (label, rest) = split_label(input);
         if label.is_empty() {
             return Prepared::Unknown;
         }
-        let Some(entry) = self.resolve(label) else {
+        let Some(entry) = self.resolve_for(label, owner) else {
             return Prepared::Unknown;
         };
         if !permitted(&entry, &source) {
@@ -362,11 +392,29 @@ impl CommandManagerImpl {
     }
 
     pub fn prepare_suggestion(&self, source: CommandSource, input: &str) -> Prepared<Completion> {
+        self.prepare_suggestion_for(source, input, None)
+    }
+
+    pub fn prepare_suggestion_owned(
+        &self,
+        source: CommandSource,
+        owner: &str,
+        input: &str,
+    ) -> Prepared<Completion> {
+        self.prepare_suggestion_for(source, input, Some(owner))
+    }
+
+    fn prepare_suggestion_for(
+        &self,
+        source: CommandSource,
+        input: &str,
+        owner: Option<&str>,
+    ) -> Prepared<Completion> {
         let input = input.trim_start();
         let Some((label, rest)) = input.split_once(char::is_whitespace) else {
             return Prepared::Unknown;
         };
-        let Some(entry) = self.resolve(label) else {
+        let Some(entry) = self.resolve_for(label, owner) else {
             return Prepared::Unknown;
         };
         if !permitted(&entry, &source) {
@@ -561,25 +609,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_namespaced_name_always_reaches_the_owner() {
+    async fn ownership_keys_are_not_public_command_labels() {
         let calls = Calls::default();
         let m = manager(&calls);
-        m.register_owned("A", CommandSpec::new("cmd"), handler("a", &calls))
+        let registered = m
+            .register_owned(
+                "A",
+                CommandSpec::new("cmd").alias("c"),
+                handler("a", &calls),
+            )
             .unwrap();
+        assert_eq!(registered.namespaced, "a:cmd");
         assert!(
             m.register_owned("b", CommandSpec::new("cmd"), handler("b", &calls))
                 .is_err()
         );
-
+        for label in ["a:cmd", "A:CMD", "b:cmd", "custom:cmd", "minecraft:cmd"] {
+            assert_eq!(
+                m.dispatch(console(), &format!("{label} 1 2")).await,
+                DispatchOutcome::Unknown
+            );
+            assert_eq!(m.suggest(console(), &format!("{label} x")).await, None);
+            assert!(m.get(label).is_none(), "{label}");
+            assert!(!m.contains(label), "{label}");
+        }
+        assert!(taken(&calls).is_empty());
+        assert!(matches!(
+            m.prepare_owned(console(), "b", "cmd x"),
+            Prepared::Unknown
+        ));
+        assert!(matches!(
+            m.prepare_owned(console(), "A", "a:cmd x"),
+            Prepared::Unknown
+        ));
+        let Prepared::Ready(internal) = m.prepare_owned(console(), "A", "cmd x") else {
+            panic!("owned runner resolves the private key");
+        };
+        internal.run().await;
+        assert_eq!(taken(&calls), ["a:cmd:x"]);
+        let Prepared::Ready(completion) = m.prepare_suggestion_owned(console(), "A", "cmd x")
+        else {
+            panic!("owned runner completes the command");
+        };
+        assert_eq!(completion.run().await, [Suggestion::new("a-x")]);
+        let tree = m.tree_for(Some(&console()));
+        assert_eq!(tree.commands, [vec!["cmd".to_string(), "c".to_string()]]);
+        assert!(tree.shadowed.iter().all(|label| !label.contains(':')));
         assert_eq!(
-            m.dispatch(console(), "a:cmd 1 2").await,
+            m.dispatch(console(), "c 1 2").await,
             DispatchOutcome::Executed
         );
+        assert_eq!(taken(&calls), ["a:c:1,2"]);
+        // Plugins may unload by their registration handle without exposing
+        // that handle as an executable label.
         assert_eq!(
-            m.dispatch(console(), "b:cmd").await,
-            DispatchOutcome::Unknown
+            m.unregister_owned("A", &registered.namespaced),
+            Ok("a:cmd".to_string())
         );
-        assert_eq!(taken(&calls), ["a:a:cmd:1,2"]);
+        assert!(!m.contains("cmd"));
+        assert!(!m.contains("c"));
     }
 
     #[tokio::test]
@@ -594,7 +682,7 @@ mod tests {
         .unwrap();
 
         assert!(m.is_plugin_command("HI"));
-        assert!(m.is_plugin_command("p:hello"));
+        assert!(!m.is_plugin_command("p:hello"));
         assert!(!m.is_plugin_command("ir"));
         assert!(m.contains("ir"));
         assert_eq!(
@@ -617,11 +705,13 @@ mod tests {
         .unwrap();
         let hello = CommandInfo::new(CommandSpec::new("hello").alias("hi"), Some("P".into()));
 
-        for label in ["hello", "HI", "p:hello", "P:Hello"] {
+        for label in ["hello", "HI"] {
             assert_eq!(m.get(label), Some(hello.clone()), "{label}");
         }
         assert_eq!(m.get_by_name("Hello"), Some(hello.clone()));
-        assert_eq!(m.get_by_name("p:hello"), Some(hello.clone()));
+        assert_eq!(m.get_by_name("p:hello"), None);
+        assert_eq!(m.get("p:hello"), None);
+        assert_eq!(m.get("P:Hello"), None);
         assert_eq!(m.get_by_name("hi"), None);
         assert_eq!(m.get_by_alias("HI"), Some(hello.clone()));
         assert_eq!(m.get_by_alias("hello"), None);
@@ -721,11 +811,11 @@ mod tests {
         assert_eq!(
             console.commands,
             [
-                vec!["admin".to_string(), "p:admin".into()],
-                vec!["open".to_string(), "o".into(), "p:open".into()],
+                vec!["admin".to_string()],
+                vec!["open".to_string(), "o".into()],
             ]
         );
-        for label in ["infrarust", "ir", "secret", "p:secret", "admin", "o"] {
+        for label in ["infrarust", "ir", "secret", "admin", "o"] {
             assert!(console.shadowed.contains(label), "{label}");
         }
     }

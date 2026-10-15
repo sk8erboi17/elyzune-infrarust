@@ -270,6 +270,7 @@ impl CommandSpec {
 #[non_exhaustive]
 pub struct CommandRegistration {
     pub name: String,
+    /// Internal ownership key used for replacement and unload; not an executable label.
     pub namespaced: String,
     pub aliases: Vec<String>,
     pub rejected_aliases: Vec<String>,
@@ -307,6 +308,7 @@ impl CommandInfo {
         &self.spec.name
     }
 
+    /// The internal ownership key, not a label registered for dispatch or completion.
     pub fn namespaced(&self) -> Option<String> {
         self.plugin_id
             .as_ref()

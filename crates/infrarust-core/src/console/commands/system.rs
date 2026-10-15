@@ -26,7 +26,7 @@ fn product_title() -> String {
 pub(crate) fn help_block(commands: &[CommandInfo], plugin_commands: &[PluginCommandInfo]) -> Block {
     let plugin_rows: Vec<(String, &PluginCommandInfo)> = plugin_commands
         .iter()
-        .filter_map(|info| info.namespaced().map(|namespaced| (namespaced, info)))
+        .filter_map(|info| info.plugin_id.as_ref().map(|owner| (owner.clone(), info)))
         .collect();
 
     let mut meta = format!("{} built-in", commands.len());
@@ -57,11 +57,11 @@ pub(crate) fn help_block(commands: &[CommandInfo], plugin_commands: &[PluginComm
 
     if !plugin_rows.is_empty() {
         let mut table = Table::bare();
-        for (namespaced, info) in plugin_rows {
+        for (owner, info) in plugin_rows {
             table.row([
                 Line::from(vec![
                     Span::plain(info.spec.name.as_str()),
-                    Span::muted(format!(" ({namespaced})")),
+                    Span::muted(format!(" ({owner})")),
                 ]),
                 Span::muted(info.spec.description.as_str()).into(),
             ]);
@@ -518,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn help_lists_namespaced_plugin_commands() {
+    fn help_lists_plain_plugin_commands_with_their_owner() {
         let plugin = vec![
             PluginCommandInfo::new(
                 CommandSpec::new("lobby").description("Go to the lobby"),
@@ -531,10 +531,10 @@ mod tests {
             rendered,
             "# Commands - 1 built-in, 1 from plugins, help <command> for details\n\
              | SYSTEM\n\
-             | status              Proxy overview\n\
+             | status        Proxy overview\n\
              |\n\
              | PLUGIN COMMANDS\n\
-             | lobby (hub:lobby)   Go to the lobby"
+             | lobby (hub)   Go to the lobby"
         );
     }
 

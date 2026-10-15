@@ -4,7 +4,7 @@ use infrarust_api::event::BoxFuture;
 use infrarust_api::plugin::{PluginHealth, PluginRuntimeStatus};
 
 use crate::commands::{CommandServices, SubcommandAlias, SubcommandHandler};
-use crate::services::command_manager::DispatchOutcome;
+use crate::services::command_manager::{DispatchOutcome, Prepared};
 
 pub(crate) struct PluginSubcommand;
 
@@ -14,7 +14,7 @@ impl SubcommandHandler for PluginSubcommand {
     }
 
     fn description(&self) -> &str {
-        "Run a plugin command by namespace"
+        "Run a command owned by a plugin"
     }
 
     fn aliases(&self) -> &'static [SubcommandAlias] {
@@ -87,11 +87,19 @@ impl SubcommandHandler for PluginSubcommand {
                 _ => {
                     let plugin_id = &args[0];
                     let command_name = &args[1];
-                    let input = namespaced_input(plugin_id, command_name, &args[2..]);
-                    let outcome = services
-                        .command_manager
-                        .dispatch(player.clone(), &input)
-                        .await;
+                    let input = command_input(command_name, &args[2..]);
+                    let outcome = match services.command_manager.prepare_owned(
+                        player.clone(),
+                        plugin_id,
+                        &input,
+                    ) {
+                        Prepared::Unknown => DispatchOutcome::Unknown,
+                        Prepared::Denied => DispatchOutcome::Denied,
+                        Prepared::Ready(invocation) => {
+                            invocation.run().await;
+                            DispatchOutcome::Executed
+                        }
+                    };
                     if outcome == DispatchOutcome::Unknown {
                         player.send_message(ProxyMessage::error(&format!(
                             "Command '{}' not found for plugin '{}'.",
@@ -132,15 +140,20 @@ impl SubcommandHandler for PluginSubcommand {
                         .collect()
                 }
                 _ => {
-                    let input = namespaced_input(&args[0], &args[1], &args[2..]);
-                    services
-                        .command_manager
-                        .suggest(source.clone(), &input)
-                        .await
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|suggestion| suggestion.text)
-                        .collect()
+                    let input = command_input(&args[1], &args[2..]);
+                    match services.command_manager.prepare_suggestion_owned(
+                        source.clone(),
+                        &args[0],
+                        &input,
+                    ) {
+                        Prepared::Ready(completion) => completion
+                            .run()
+                            .await
+                            .into_iter()
+                            .map(|suggestion| suggestion.text)
+                            .collect(),
+                        Prepared::Unknown | Prepared::Denied => Vec::new(),
+                    }
                 }
             }
         })
@@ -162,8 +175,8 @@ fn health_note(runtime: Option<&PluginRuntimeStatus>) -> String {
     }
 }
 
-fn namespaced_input(plugin_id: &str, command: &str, rest: &[String]) -> String {
-    format!("{plugin_id}:{command} {}", rest.join(" "))
+fn command_input(command: &str, rest: &[String]) -> String {
+    format!("{command} {}", rest.join(" "))
 }
 
 #[cfg(test)]
