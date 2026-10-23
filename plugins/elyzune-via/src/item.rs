@@ -146,13 +146,14 @@ pub fn optional_stack(x: &mut Xc<'_>, r: &mut Reader<'_>, out: &mut Vec<u8>) -> 
 
 /// A slot stack the client may later make claims about (container contents,
 /// one slot, the cursor, a player inventory slot): translated like
-/// [`optional_stack`], and recorded in `records` when the translation
-/// changed what the client will hash (`hashed.rs`).
+/// [`optional_stack`], and, when the translation changed what the client
+/// will hash, sent with the server's hashes backed up in its `custom_data`
+/// and recorded in `records` under that `custom_data`'s hash (`hashed.rs`).
 pub fn slot_stack(
     x: &mut Xc<'_>,
     r: &mut Reader<'_>,
     out: &mut Vec<u8>,
-    records: &mut Vec<crate::hashed::Sent>,
+    records: &mut Vec<(i32, crate::hashed::Sent)>,
 ) -> Xresult<()> {
     let start = r.pos();
     let out_start = out.len();
@@ -176,12 +177,130 @@ pub fn slot_stack(
             _ => false,
         }
     };
-    if (item_changed || x.hash_changed)
-        && let Some(record) = sent_record(x.t, server, client)?
-    {
-        records.push(record);
+    if !(item_changed || x.hash_changed) {
+        return Ok(());
+    }
+    // The stack itself is already translated: a failure to re-read it for
+    // the record only costs the resends the record would have avoided, so
+    // it is noted instead of failing the packet.
+    let marked = sent_record(x.t, server, client).and_then(|record| match record {
+        Some(record) => back_up_hashes(x.t, server, client, record),
+        None => Ok(None),
+    });
+    match marked {
+        Ok(Some((key, record, marked))) => {
+            out.truncate(out_start);
+            out.extend_from_slice(&marked);
+            records.push((key, record));
+        }
+        Ok(None) => {}
+        Err(_) => x.notes.push(
+            "a translated slot stack could not be re-read for its click claims; \
+             clicks on it are corrected by a resend",
+        ),
     }
     Ok(())
+}
+
+/// The client's stack `client` (a translation of the server's `server`)
+/// with the server-side hashes of `record` backed up in its `custom_data`
+/// (`hashed::original_hashes` under `hashed::ORIGINAL_HASHES_KEY`, the
+/// component created when the server's stack had none), the hash of that
+/// `custom_data` as the client will claim it, and the record adjusted to
+/// the stack actually sent: the client's component ids include
+/// `custom_data`, and the server's own `custom_data`, which the client no
+/// longer holds as is, is claimed with its computed hash.
+///
+/// `None` when the record could never answer a claim (a server component
+/// this translator cannot hash, including a `custom_data` it cannot read):
+/// the stack is then sent unchanged and claims about it reach the server
+/// renumbered, which costs a resend and never a wrong match.
+fn back_up_hashes(
+    t: &crate::session::ViaTranslator,
+    server: &[u8],
+    client: &[u8],
+    mut record: crate::hashed::Sent,
+) -> Xresult<Option<(i32, crate::hashed::Sent, Vec<u8>)>> {
+    use crate::hashed::{CREATED_KEY, Claim, ORIGINAL_HASHES_KEY, as_int, original_hashes};
+    if !record.usable() {
+        return Ok(None);
+    }
+    let client_number = t.client.number().unsigned_abs();
+    let Some(client_type) = id_of(
+        Reg::DataComponentType,
+        client_number,
+        "minecraft:custom_data",
+    ) else {
+        return Ok(None);
+    };
+    let (Some(server_stack), Some(client_stack)) = (
+        read_stack(t, Proto::V776, server)?,
+        read_stack(t, t.client, client)?,
+    ) else {
+        return Ok(None);
+    };
+    // The backup is built before the server's own custom_data turns into a
+    // computed claim below: what the client can see of it (all of it) is
+    // part of the key already.
+    let backup = original_hashes(&record);
+    for (ty, claim) in &mut record.server_added {
+        if component_name(Proto::V776, *ty) == Some("minecraft:custom_data") {
+            let Some(entry) = server_stack.added.iter().find(|e| e.ty == *ty) else {
+                return Ok(None);
+            };
+            *claim = server_hash(t, entry);
+            if *claim == Claim::Unknown {
+                return Ok(None);
+            }
+        }
+    }
+    // A patch that removes custom_data cannot also carry one; no vanilla
+    // item has a default custom_data, so this is a backend oddity, left to
+    // resends.
+    if client_stack.removed.contains(&client_type) {
+        return Ok(None);
+    }
+    let existing = client_stack.added.iter().find(|e| e.ty == client_type);
+    let mut custom_data = match existing {
+        Some(entry) => match Tag::read(&mut Reader::new(entry.value))? {
+            Some(tag @ Tag::Compound(_)) => tag,
+            _ => return Ok(None),
+        },
+        None => Tag::Compound(vec![(CREATED_KEY.as_bytes().to_vec(), Tag::Byte(1))]),
+    };
+    custom_data.insert(ORIGINAL_HASHES_KEY, backup);
+    let Some(key) = crate::hashed::nbt(&custom_data) else {
+        return Ok(None);
+    };
+    let mut value = Vec::new();
+    custom_data.write(&mut value);
+
+    // Count first, then the item and the patch with custom_data replaced in
+    // place or appended (a patch's order carries no meaning to the client).
+    let mut marked = Vec::with_capacity(client.len() + value.len() + 2);
+    marked.put_varint(Reader::new(client).varint()?);
+    marked.put_varint(wire_id(client_stack.item));
+    marked.put_len(client_stack.added.len() + usize::from(existing.is_none()));
+    marked.put_len(client_stack.removed.len());
+    for entry in &client_stack.added {
+        marked.put_varint(wire_id(entry.ty));
+        if entry.ty == client_type {
+            marked.put_bytes(&value);
+        } else {
+            marked.put_bytes(entry.value);
+        }
+    }
+    if existing.is_none() {
+        marked.put_varint(wire_id(client_type));
+        marked.put_bytes(&value);
+        if let Err(at) = record.client_added.binary_search(&client_type) {
+            record.client_added.insert(at, client_type);
+        }
+    }
+    for ty in &client_stack.removed {
+        marked.put_varint(wire_id(*ty));
+    }
+    Ok(Some((as_int(key), record, marked)))
 }
 
 /// The serverbound creative-slot stack: optional, with a delimited patch.
@@ -193,8 +312,20 @@ pub fn untrusted_stack(x: &mut Xc<'_>, r: &mut Reader<'_>, out: &mut Vec<u8>) ->
     }
     let id = read_u32(r)?;
     let mut body = Vec::new();
+    x.backup_item = None;
     patch(x, r, &mut body, true, Some(id))?;
-    match item(x, id) {
+    // A stand-in the translator sent (`slot_stack`) goes back as the server
+    // item its backup names, as ViaBackwards restores its own backup's id:
+    // a creative player moving 26.2 cinnabar bricks on 1.21.11 must not
+    // turn them into the cut red sandstone shown for them. Only that
+    // substitution is undone: the backup's item must be the one this
+    // client is shown as the item it sent.
+    let restored = x.backup_item.take().filter(|server| {
+        *server != id
+            && x.t.tables.reg(Reg::Item).s2c(*server) == Some(id)
+            && x.t.tables.reg(Reg::Item).c2s(id) != Some(*server)
+    });
+    match restored.or_else(|| item(x, id)) {
         Some(id) => {
             out.put_varint(count);
             out.put_varint(wire_id(id));
@@ -463,11 +594,44 @@ pub fn patch(
             Rule::Plain => {
                 let dst_type = x.map_static(Reg::DataComponentType, src_type);
                 let mut value = Vec::new();
+                let start = value_reader.pos();
                 match (
                     convert_or_skip(x, name, dst_type, value_reader, &mut value),
                     dst_type,
                 ) {
                     (Ok(()), Some(dst)) => {
+                        // Rewritten text, an inline holder or block entity
+                        // data can keep its component id while changing the
+                        // codec hash: `sent_record` compares the two hashes.
+                        if matches!(
+                            name,
+                            "minecraft:custom_name"
+                                | "minecraft:item_name"
+                                | "minecraft:lore"
+                                | "minecraft:instrument"
+                                | "minecraft:provides_trim_material"
+                                | "minecraft:trim"
+                                | "minecraft:block_entity_data"
+                        ) && value_reader.since(start) != value
+                        {
+                            x.hash_changed = true;
+                        }
+                        // The hash backup a translated slot stack was sent
+                        // with (`back_up_hashes`) never reaches the server:
+                        // a creative client sends the stack back whole.
+                        if name == "minecraft:custom_data"
+                            && x.dir == Dir::C2s
+                            && memchr::memmem::find(&value, b"elyzune-via|").is_some()
+                            && let Some(mut tag) = Tag::read(&mut Reader::new(&value))?
+                        {
+                            let stripped = crate::hashed::strip_backup(&mut tag);
+                            x.backup_item = stripped.server_item;
+                            if !stripped.keep {
+                                continue;
+                            }
+                            value.clear();
+                            tag.write(&mut value);
+                        }
                         if name == "minecraft:block_entity_data"
                             && x.dir == Dir::C2s
                             && x.t.client == Proto::V777
@@ -477,6 +641,39 @@ pub fn patch(
                             if let Some(tag) = Tag::read(&mut v)? {
                                 held_block_entity = Some((ty, tag));
                                 continue;
+                            }
+                        }
+                        // A 26.3 item carries a sign's text and wax as
+                        // components (`crate::codec::unfold_sign`).
+                        if name == "minecraft:block_entity_data"
+                            && x.dir == Dir::S2c
+                            && x.t.client == Proto::V777
+                        {
+                            let mut v = Reader::new(&value);
+                            let ty = read_u32(&mut v)?;
+                            let kind = name_of(Reg::BlockEntityType, 777, ty).unwrap_or("");
+                            if let Some(mut tag) = Tag::read(&mut v)? {
+                                let (parts, rest) = crate::codec::unfold_sign(kind, &mut tag);
+                                if !parts.is_empty() {
+                                    x.hash_changed = true;
+                                    for (component, part) in parts {
+                                        let Some(id) = dst_component(x, component) else {
+                                            continue;
+                                        };
+                                        let mut bytes = Vec::new();
+                                        if component != "minecraft:waxed" {
+                                            sign_text_to_network(&part, &mut bytes);
+                                        }
+                                        push(&mut body, &mut kept_added, &mut emitted, id, &bytes);
+                                    }
+                                    if rest {
+                                        let mut bytes = Vec::new();
+                                        bytes.put_varint(wire_id(ty));
+                                        tag.write(&mut bytes);
+                                        push(&mut body, &mut kept_added, &mut emitted, dst, &bytes);
+                                    }
+                                    continue;
+                                }
                             }
                         }
                         push(&mut body, &mut kept_added, &mut emitted, dst, &value);
@@ -607,6 +804,45 @@ fn sign_text_to_nbt(x: &mut Xc<'_>, r: &mut Reader<'_>) -> Xresult<Tag> {
     fields.push((b"color".to_vec(), Tag::string(color)));
     fields.push((b"has_glowing_text".to_vec(), Tag::Byte(i8::from(r.bool()?))));
     Ok(Tag::Compound(fields))
+}
+
+/// The reverse of [`sign_text_to_nbt`]: a `SignText` in codec form (as a
+/// sign's `front_text`/`back_text`, its lines already in the client's text
+/// form) written in 26.3's network form.
+fn sign_text_to_network(text: &Tag, out: &mut Vec<u8>) {
+    fn lines(text: &Tag, key: &str) -> Option<Vec<Tag>> {
+        match text.get(key) {
+            Some(Tag::List(_, lines)) => Some(lines.clone()),
+            _ => None,
+        }
+    }
+    fn put_lines(out: &mut Vec<u8>, lines: &[Tag]) {
+        for index in 0..4 {
+            lines
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| Tag::string(""))
+                .write(out);
+        }
+    }
+    put_lines(out, &lines(text, "messages").unwrap_or_default());
+    match lines(text, "filtered_messages") {
+        Some(filtered) => {
+            out.put_bool(true);
+            put_lines(out, &filtered);
+        }
+        None => out.put_bool(false),
+    }
+    let color = text
+        .get("color")
+        .and_then(Tag::as_str)
+        .and_then(|name| {
+            let name = name.strip_prefix("minecraft:").unwrap_or(name);
+            crate::codec::DYE_COLORS.iter().position(|dye| *dye == name)
+        })
+        .unwrap_or(15);
+    out.put_varint(i32::try_from(color).unwrap_or(15));
+    out.put_bool(matches!(text.get("has_glowing_text"), Some(Tag::Byte(glowing)) if *glowing != 0));
 }
 
 /// Converts one component value, or steps over it when the destination has
@@ -1061,6 +1297,16 @@ struct RawStack<'a> {
 
 /// A top-level stack's item and patch, read in protocol `proto` without
 /// translating (`ItemStack.OPTIONAL_STREAM_CODEC`): `None` for an empty slot.
+///
+/// `proto` is 776 (the server's bytes) or the client's release (the bytes
+/// this translator just wrote for it). 1.21.11 reads with 26.1's tables
+/// except for its reshaped components (`RESHAPED_774`), whose values are
+/// stepped over with the hand-written 1.21.11 -> 26.2 converter in identity
+/// mode: reading them with 26.1's layout would stop inside the value (an
+/// `EitherHolder` is one Bool longer, a nested stack is count first) and
+/// misread every component after it. Bytes left over after the patch are an
+/// error for the same reason: a stack that does not read to its last byte
+/// was not understood, and nothing may be recorded or re-encoded from it.
 fn read_stack<'a>(
     t: &crate::session::ViaTranslator,
     proto: Proto,
@@ -1086,11 +1332,16 @@ fn read_stack<'a>(
         let ty = read_u32(&mut r)?;
         let name = component_name(proto, ty)
             .ok_or(Xerr::Wire(WireError::Malformed("unknown component type")))?;
-        let layout = component_layout(&x, name).ok_or(Xerr::Wire(WireError::Malformed(
-            "component without a layout",
-        )))?;
         let start = r.pos();
-        skip_value(&mut x, layout, &mut r)?;
+        if proto == Proto::V774 && reshaped(Proto::V774, name) {
+            let mut sink = Vec::new();
+            x.with_identity(|x| reshape_774(x, name, &mut r, &mut sink))?;
+        } else {
+            let layout = component_layout(&x, name).ok_or(Xerr::Wire(WireError::Malformed(
+                "component without a layout",
+            )))?;
+            skip_value(&mut x, layout, &mut r)?;
+        }
         entries.push(Entry {
             ty,
             name,
@@ -1100,6 +1351,11 @@ fn read_stack<'a>(
     let mut gone = Vec::with_capacity(removed.min(64));
     for _ in 0..removed {
         gone.push(read_u32(&mut r)?);
+    }
+    if !r.is_empty() {
+        return Err(Xerr::Wire(WireError::Malformed(
+            "bytes left after a stack's patch",
+        )));
     }
     Ok(Some(RawStack {
         item,
@@ -1129,32 +1385,112 @@ pub fn sent_record(
     let client_number = t.client.number().unsigned_abs();
     let mut changed = name_of(Reg::Item, 776, s_item) != name_of(Reg::Item, client_number, c_item);
     let x = Xc::new(t, Dir::S2c);
-    let mut server_added = Vec::with_capacity(s_added.len());
-    for entry in &s_added {
-        // The client component this one became, if any.
-        let counterpart = if rule(&x, entry.name) == Rule::SplitSwing {
+    // The client component ids some server component accounts for: its
+    // counterpart, and for 26.3's split swing the interact animation too
+    // (a claim's two animations go back as one swing: `hashed_stack`).
+    let split_extra = id_of(
+        Reg::DataComponentType,
+        client_number,
+        "minecraft:interact_animation",
+    );
+    let counterpart_of = |name: &str, ty: u32| {
+        if rule(&x, name) == Rule::SplitSwing {
             id_of(
                 Reg::DataComponentType,
                 client_number,
                 "minecraft:attack_animation",
             )
         } else {
-            x.map_static(Reg::DataComponentType, entry.ty)
+            x.map_static(Reg::DataComponentType, ty)
         }
-        .filter(|c| c_added.iter().any(|e| e.ty == *c));
-        let same_form = !(t.client == Proto::V777 && entry.name == "minecraft:pot_decorations");
-        let claim = match counterpart {
-            Some(c) if same_form => Claim::FromClient(c),
-            _ => {
-                changed = true;
-                server_hash(t, entry)
+    };
+    let mut explained = Vec::with_capacity(s_added.len() + 1);
+    let mut server_added = Vec::with_capacity(s_added.len());
+    for entry in &s_added {
+        // The client component this one became, if any.
+        let counterpart =
+            counterpart_of(entry.name, entry.ty).filter(|c| c_added.iter().any(|e| e.ty == *c));
+        if let Some(c) = counterpart {
+            explained.push(c);
+            if rule(&x, entry.name) == Rule::SplitSwing {
+                explained.extend(split_extra);
             }
+        }
+        // Values the translation can rewrite in place (text through its
+        // hovers, inline holders, block entity data: renumbered types,
+        // stand-in items inside, 26.3 sign text taken out).
+        let rewritten_value = matches!(
+            entry.name,
+            "minecraft:custom_name"
+                | "minecraft:item_name"
+                | "minecraft:lore"
+                | "minecraft:instrument"
+                | "minecraft:provides_trim_material"
+                | "minecraft:trim"
+                | "minecraft:block_entity_data"
+        ) && counterpart
+            .and_then(|id| c_added.iter().find(|value| value.ty == id))
+            .is_some_and(|value| value.value != entry.value);
+        let same_form = !(rewritten_value
+            || t.client == Proto::V777 && entry.name == "minecraft:pot_decorations");
+        let claim = match counterpart {
+            Some(c) if rewritten_value => {
+                match (
+                    server_hash(t, entry),
+                    c_added
+                        .iter()
+                        .find(|value| value.ty == c)
+                        .map(|value| value_hash(t, t.client, value)),
+                ) {
+                    // Different bytes, same codec value (1.21.11's
+                    // EitherHolder byte, 26.3's durability damage left at
+                    // its default, a block entity type renumbered): the
+                    // client's hash already is the server's, so nothing
+                    // about this component needs answering for it.
+                    // ViaVersion compares the hashes in the same way before
+                    // it backs anything up (`storeOriginalHashedItemIfNeeded`).
+                    (Claim::Computed(server), Some(Claim::Computed(expected)))
+                        if server == expected =>
+                    {
+                        Claim::FromClient(c)
+                    }
+                    (Claim::Computed(server), Some(Claim::Computed(expected))) => {
+                        Claim::Rewritten {
+                            client: c,
+                            expected,
+                            server,
+                        }
+                    }
+                    _ => Claim::Unknown,
+                }
+            }
+            Some(c) if same_form => Claim::FromClient(c),
+            _ => server_hash(t, entry),
         };
+        changed |= !matches!(claim, Claim::FromClient(_));
         server_added.push((entry.ty, claim));
     }
-    // A component the client has and the server does not (26.3's interact
-    // animation, split from the swing) also makes the claims differ.
-    changed |= c_added.len() != s_added.len();
+    // A component the client holds that no server component accounts for
+    // (26.3's sign text taken out of block entity data) makes the claims
+    // differ, and so does a removal the client cannot claim (a component
+    // its release lacks) or one it claims that the server's patch does not
+    // hold. 26.3's split swing is neither: its two animations, added or
+    // removed, go back as the one swing.
+    changed |= c_added.iter().any(|e| !explained.contains(&e.ty));
+    let mut removal_explained = Vec::with_capacity(s_removed.len() + 1);
+    for ty in &s_removed {
+        let name = component_name(Proto::V776, *ty).unwrap_or("");
+        match counterpart_of(name, *ty).filter(|c| c_removed.contains(c)) {
+            Some(c) => {
+                removal_explained.push(c);
+                if rule(&x, name) == Rule::SplitSwing {
+                    removal_explained.extend(split_extra);
+                }
+            }
+            None => changed = true,
+        }
+    }
+    changed |= c_removed.iter().any(|ty| !removal_explained.contains(ty));
     if !changed {
         return Ok(None);
     }
@@ -1176,10 +1512,58 @@ pub fn sent_record(
 /// a translation drops or reshapes and whose codec form is simple enough to
 /// hash here. Everything else is [`Claim::Unknown`](crate::hashed::Claim).
 fn server_hash(t: &crate::session::ViaTranslator, entry: &Entry<'_>) -> crate::hashed::Claim {
+    value_hash(t, Proto::V776, entry)
+}
+
+fn value_hash(
+    t: &crate::session::ViaTranslator,
+    proto: Proto,
+    entry: &Entry<'_>,
+) -> crate::hashed::Claim {
     use crate::hashed::{Claim, as_int, int, list, map, string};
     let mut r = Reader::new(entry.value);
     let hash = (|| -> WireResult<Option<u32>> {
         Ok(match entry.name {
+            "minecraft:instrument" | "minecraft:provides_trim_material" | "minecraft:trim" => {
+                // 1.21.11 wraps these two component holders in EitherHolder;
+                // ArmorTrim's nested material/pattern never has that wrapper.
+                if proto == Proto::V774 && entry.name != "minecraft:trim" && !r.bool()? {
+                    Some(hash_identifier(r.string()?))
+                } else {
+                    match entry.name {
+                        "minecraft:instrument" => instrument_hash(t, proto, &mut r)?,
+                        "minecraft:provides_trim_material" => trim_material_hash(t, proto, &mut r)?,
+                        _ => {
+                            match (
+                                trim_material_hash(t, proto, &mut r)?,
+                                trim_pattern_hash(t, proto, &mut r)?,
+                            ) {
+                                (Some(material), Some(pattern)) => Some(map(vec![
+                                    (string("material"), material),
+                                    (string("pattern"), pattern),
+                                ])),
+                                _ => None,
+                            }
+                        }
+                    }
+                }
+            }
+            "minecraft:custom_name" | "minecraft:item_name" => {
+                Tag::read(&mut r)?.as_ref().and_then(crate::hashed::text)
+            }
+            "minecraft:lore" => {
+                let count = r.len()?;
+                let mut lines = Vec::with_capacity(count.min(64));
+                for _ in 0..count {
+                    let Some(hash) = Tag::read(&mut r)?.as_ref().and_then(crate::hashed::text)
+                    else {
+                        return Ok(None);
+                    };
+                    lines.push(hash);
+                }
+                Some(list(lines))
+            }
+            "minecraft:custom_data" => Tag::read(&mut r)?.as_ref().and_then(crate::hashed::nbt),
             // MapItemColor: Codec.INT.
             "minecraft:map_color" => Some(int(r.i32()?)),
             // DyeColor: its name.
@@ -1221,6 +1605,22 @@ fn server_hash(t: &crate::session::ViaTranslator, entry: &Entry<'_>) -> crate::h
                     _ => None,
                 }
             }
+            // `TypedEntityData`: the saved fields with the type's name put
+            // back under `id`, through `CompoundTag.CODEC` (NBT by type).
+            "minecraft:block_entity_data" => {
+                let ty = read_wire_u32(&mut r)?;
+                let Some(kind) = name_of(Reg::BlockEntityType, proto.number().unsigned_abs(), ty)
+                else {
+                    return Ok(None);
+                };
+                match Tag::read(&mut r)? {
+                    Some(mut tag @ Tag::Compound(_)) => {
+                        tag.insert("id", Tag::string(kind));
+                        crate::hashed::nbt(&tag)
+                    }
+                    _ => None,
+                }
+            }
             // 26.2 pot decorations: `PotDecorations.ordered()`, the four
             // sides' item names with brick for an empty side.
             "minecraft:pot_decorations" => {
@@ -1241,9 +1641,142 @@ fn server_hash(t: &crate::session::ViaTranslator, entry: &Entry<'_>) -> crate::h
         })
     })();
     match hash {
-        Ok(Some(h)) => Claim::Computed(as_int(h)),
+        Ok(Some(h)) if r.is_empty() => Claim::Computed(as_int(h)),
         _ => Claim::Unknown,
     }
+}
+
+fn hash_identifier(name: &str) -> u32 {
+    crate::hashed::string(&crate::codec::qualified(name))
+}
+
+/// A holder reference hashes as its registry key, not its protocol id.
+/// Client ids may have been compacted during configuration.
+fn holder_reference_hash(
+    t: &crate::session::ViaTranslator,
+    proto: Proto,
+    registry: &str,
+    raw: u32,
+) -> Option<u32> {
+    let registry = t.conn.dynamic(registry)?;
+    let id = raw.checked_sub(1)?;
+    let id = if proto == Proto::V776 {
+        id
+    } else {
+        registry.c2s(id)?
+    };
+    registry
+        .names
+        .get(id as usize)
+        .map(|name| hash_identifier(name))
+}
+
+fn sound_hash(proto: Proto, r: &mut Reader<'_>) -> WireResult<Option<u32>> {
+    use crate::hashed::{float, map, string};
+    let raw = read_wire_u32(r)?;
+    if raw > 0 {
+        return Ok(
+            name_of(Reg::SoundEvent, proto.number().unsigned_abs(), raw - 1).map(hash_identifier),
+        );
+    }
+    let mut fields = vec![(string("sound_id"), hash_identifier(r.string()?))];
+    if r.bool()? {
+        fields.push((string("range"), float(r.f32()?)));
+    }
+    Ok(Some(map(fields)))
+}
+
+fn instrument_hash(
+    t: &crate::session::ViaTranslator,
+    proto: Proto,
+    r: &mut Reader<'_>,
+) -> WireResult<Option<u32>> {
+    use crate::hashed::{float, int, map, string, text};
+    let raw = read_wire_u32(r)?;
+    if raw > 0 {
+        return Ok(holder_reference_hash(t, proto, "minecraft:instrument", raw));
+    }
+    let sound = sound_hash(proto, r)?;
+    let duration = r.f32()?;
+    let range = r.f32()?;
+    let damage = if proto == Proto::V777 { r.varint()? } else { 0 };
+    let description = Tag::read(r)?.as_ref().and_then(text);
+    let (Some(sound), Some(description)) = (sound, description) else {
+        return Ok(None);
+    };
+    let mut fields = vec![
+        (string("sound_event"), sound),
+        (string("use_duration"), float(duration)),
+        (string("range"), float(range)),
+        (string("description"), description),
+    ];
+    if damage != 0 {
+        fields.push((string("durability_damage"), int(damage)));
+    }
+    Ok(Some(map(fields)))
+}
+
+fn trim_material_hash(
+    t: &crate::session::ViaTranslator,
+    proto: Proto,
+    r: &mut Reader<'_>,
+) -> WireResult<Option<u32>> {
+    use crate::hashed::{map, string, text};
+    let raw = read_wire_u32(r)?;
+    if raw > 0 {
+        return Ok(holder_reference_hash(
+            t,
+            proto,
+            "minecraft:trim_material",
+            raw,
+        ));
+    }
+    let mut fields = Vec::new();
+    if proto == Proto::V777 {
+        fields.push((string("palette_id"), hash_identifier(r.string()?)));
+    } else {
+        fields.push((string("asset_name"), string(r.string()?)));
+        let count = r.len()?;
+        let mut overrides = Vec::with_capacity(count.min(64));
+        for _ in 0..count {
+            overrides.push((hash_identifier(r.string()?), string(r.string()?)));
+        }
+        if !overrides.is_empty() {
+            fields.push((string("override_armor_assets"), map(overrides)));
+        }
+    }
+    let Some(description) = Tag::read(r)?.as_ref().and_then(text) else {
+        return Ok(None);
+    };
+    fields.push((string("description"), description));
+    Ok(Some(map(fields)))
+}
+
+fn trim_pattern_hash(
+    t: &crate::session::ViaTranslator,
+    proto: Proto,
+    r: &mut Reader<'_>,
+) -> WireResult<Option<u32>> {
+    use crate::hashed::{boolean, map, string, text};
+    let raw = read_wire_u32(r)?;
+    if raw > 0 {
+        return Ok(holder_reference_hash(
+            t,
+            proto,
+            "minecraft:trim_pattern",
+            raw,
+        ));
+    }
+    let asset = hash_identifier(r.string()?);
+    let description = Tag::read(r)?.as_ref().and_then(text);
+    let decal = boolean(r.bool()?);
+    Ok(description.map(|description| {
+        map(vec![
+            (string("asset_id"), asset),
+            (string("description"), description),
+            (string("decal"), decal),
+        ])
+    }))
 }
 
 fn read_wire_u32(r: &mut Reader<'_>) -> WireResult<u32> {
@@ -1254,14 +1787,21 @@ fn read_wire_u32(r: &mut Reader<'_>) -> WireResult<u32> {
 /// VarInt count, Map<VarInt type, i32 hash> added, List<VarInt type>
 /// removed`.
 ///
-/// A claim about a stack the translation changed (`hashed.rs`) becomes the
-/// claim about the server's stack: its item, its component ids, and for each
-/// component the client's hash (same codec form) or the hash computed when
-/// the stack was sent. Any other claim has its ids renumbered and keeps the
-/// client's hashes, which match whenever the codec forms agree; 26.3's
-/// attack and interact animations are claimed as 26.2's swing animation
-/// (same codec, same hash).
-pub fn hashed_stack(x: &mut Xc<'_>, r: &mut Reader<'_>, out: &mut Vec<u8>) -> Xresult<()> {
+/// A claim about a stack the translation changed (`hashed.rs`), found by
+/// the hash of the `custom_data` it was sent with, becomes the claim about
+/// the server's stack: its item, its component ids, and for each component
+/// the client's hash (same codec form) or the hash computed when the stack
+/// was sent; the backup in `custom_data` never reaches the server. Any
+/// other claim has its ids renumbered and keeps the client's hashes, which
+/// match whenever the codec forms agree; 26.3's attack and interact
+/// animations are claimed as 26.2's swing animation (same codec, same
+/// hash).
+pub fn hashed_stack(
+    x: &mut Xc<'_>,
+    r: &mut Reader<'_>,
+    out: &mut Vec<u8>,
+    answered: &mut Vec<crate::hashed::RecordKey>,
+) -> Xresult<()> {
     use crate::hashed::Claim;
     if !r.bool()? {
         out.put_bool(false);
@@ -1286,9 +1826,26 @@ pub fn hashed_stack(x: &mut Xc<'_>, r: &mut Reader<'_>, out: &mut Vec<u8>) -> Xr
     added_types.sort_unstable();
     let mut removed_sorted = removed_types.clone();
     removed_sorted.sort_unstable();
-    if let Some(sent) = x.t.conn.sent_stacks.find(id, &added_types, &removed_sorted)
-        && sent.server_added.iter().all(|(_, c)| *c != Claim::Unknown)
-    {
+    // The record is found by the claimed custom_data hash: a stack sent
+    // with a backup carries it there (`back_up_hashes`), and nothing else
+    // can tell two server stacks apart that the client holds identically.
+    let custom_data = id_of(
+        Reg::DataComponentType,
+        x.t.client.number().unsigned_abs(),
+        "minecraft:custom_data",
+    );
+    let record = claims
+        .iter()
+        .find(|(ty, _)| Some(*ty) == custom_data)
+        .and_then(|(_, hash)| {
+            let key = crate::hashed::RecordKey::of_claim(*hash, id, &added_types, &removed_sorted);
+            x.t.conn
+                .sent_stacks
+                .find(&key, &claims)
+                .map(|sent| (key, sent))
+        });
+    if let Some((key, sent)) = record {
+        answered.push(key);
         out.put_bool(true);
         out.put_varint(wire_id(sent.server_item));
         out.put_varint(count);
@@ -1300,6 +1857,7 @@ pub fn hashed_stack(x: &mut Xc<'_>, r: &mut Reader<'_>, out: &mut Vec<u8>) -> Xr
                     .find(|(ty, _)| ty == c)
                     .map_or(0, |(_, hash)| *hash),
                 Claim::Computed(hash) => *hash,
+                Claim::Rewritten { server, .. } => *server,
                 Claim::Unknown => 0,
             };
             out.put_varint(wire_id(*ty));
@@ -1362,4 +1920,130 @@ pub fn hashed_stack(x: &mut Xc<'_>, r: &mut Reader<'_>, out: &mut Vec<u8>) -> Xr
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod hash_tests {
+    use super::*;
+
+    // Bytes and hashes emitted by the official 26.2/26.3 jars using the
+    // existing ItemData.java generator (26.3 constructor shapes adapted).
+    #[test]
+    fn inline_and_unicode_components_match_official_776_and_777_vectors() {
+        let translator = crate::session::ViaTranslator::new(Proto::V777, 1);
+        for (proto, name, hex, expected) in [
+            (
+                Proto::V776,
+                "minecraft:custom_name",
+                "08000f4d757369636120eda0b4edb49ec080",
+                -1487372295,
+            ),
+            (
+                Proto::V776,
+                "minecraft:custom_data",
+                "0a08000c636869617665eda0b4edb49e000e76616c6f7265c080eda0b4edb49e00",
+                -714588058,
+            ),
+            (
+                Proto::V776,
+                "minecraft:instrument",
+                "00000c656c797a756e653a686f726e0040e0000043800000080005436f726e6f",
+                -140489936,
+            ),
+            (
+                Proto::V776,
+                "minecraft:instrument",
+                "00000c656c797a756e653a686f726e01430000003fc00000420000000a080005636f6c6f7200072338384330453808000474657874000c53706164612064656c205265010004626f6c64010100066974616c69630000",
+                -221739880,
+            ),
+            (
+                Proto::V776,
+                "minecraft:provides_trim_material",
+                "00076d69746872696c000800074d69746872696c",
+                -219312053,
+            ),
+            (
+                Proto::V776,
+                "minecraft:provides_trim_material",
+                "00076d69746872696c010e6d696e6563726166743a69726f6e0e6d69746872696c5f6461726b65720a080005636f6c6f7200072338384330453808000474657874000c53706164612064656c205265010004626f6c64010100066974616c69630000",
+                1643090981,
+            ),
+            (
+                Proto::V776,
+                "minecraft:trim",
+                "00076d69746872696c000800074d69746872696c000d656c797a756e653a7370697265080005537069726500",
+                820957339,
+            ),
+            (
+                Proto::V776,
+                "minecraft:trim",
+                "00076d69746872696c010e6d696e6563726166743a69726f6e0e6d69746872696c5f6461726b65720a080005636f6c6f7200072338384330453808000474657874000c53706164612064656c205265010004626f6c64010100066974616c69630000000d656c797a756e653a73706972650a080005636f6c6f7200072338384330453808000474657874000c53706164612064656c205265010004626f6c64010100066974616c6963000001",
+                1287871806,
+            ),
+            (
+                Proto::V777,
+                "minecraft:custom_name",
+                "08000f4d757369636120eda0b4edb49ec080",
+                -1487372295,
+            ),
+            (
+                Proto::V777,
+                "minecraft:custom_data",
+                "0a08000c636869617665eda0b4edb49e000e76616c6f7265c080eda0b4edb49e00",
+                -714588058,
+            ),
+            (
+                Proto::V777,
+                "minecraft:instrument",
+                "00000c656c797a756e653a686f726e0040e000004380000000080005436f726e6f",
+                -140489936,
+            ),
+            (
+                Proto::V777,
+                "minecraft:instrument",
+                "00000c656c797a756e653a686f726e01430000003fc0000042000000000a080005636f6c6f7200072338384330453808000474657874000c53706164612064656c205265010004626f6c64010100066974616c69630000",
+                -221739880,
+            ),
+            (
+                Proto::V777,
+                "minecraft:provides_trim_material",
+                "00166d696e6563726166743a7472696d2f6d69746872696c0800074d69746872696c",
+                -342855194,
+            ),
+            (
+                Proto::V777,
+                "minecraft:provides_trim_material",
+                "00166d696e6563726166743a7472696d2f6d69746872696c0a080005636f6c6f7200072338384330453808000474657874000c53706164612064656c205265010004626f6c64010100066974616c69630000",
+                -1168115561,
+            ),
+            (
+                Proto::V777,
+                "minecraft:trim",
+                "00166d696e6563726166743a7472696d2f6d69746872696c0800074d69746872696c000d656c797a756e653a7370697265080005537069726500",
+                1334830686,
+            ),
+            (
+                Proto::V777,
+                "minecraft:trim",
+                "00166d696e6563726166743a7472696d2f6d69746872696c0a080005636f6c6f7200072338384330453808000474657874000c53706164612064656c205265010004626f6c64010100066974616c69630000000d656c797a756e653a73706972650a080005636f6c6f7200072338384330453808000474657874000c53706164612064656c205265010004626f6c64010100066974616c6963000001",
+                -1089483449,
+            ),
+        ] {
+            let bytes: Vec<_> = (0..hex.len())
+                .step_by(2)
+                .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).expect("hex"))
+                .collect();
+            let entry = Entry {
+                ty: 0,
+                name,
+                value: &bytes,
+            };
+            assert_eq!(
+                value_hash(&translator, proto, &entry),
+                crate::hashed::Claim::Computed(expected),
+                "{proto:?} {name}"
+            );
+        }
+    }
 }

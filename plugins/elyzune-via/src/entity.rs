@@ -253,6 +253,8 @@ pub fn set_entity_data(t: &mut ViaTranslator, body: &[u8]) -> WireResult<Option<
             Err(Xerr::Wire(e)) => return Err(e),
             Err(Xerr::Absent(_)) => {
                 // Step over the value without remapping, then drop it.
+                x.notes
+                    .push("an entity data value with no equivalent on the client was removed");
                 let mut sink = Vec::new();
                 x.with_identity(|x| value(x, ser, &mut r, &mut sink))
                     .map_err(|e| match e {
@@ -263,6 +265,8 @@ pub fn set_entity_data(t: &mut ViaTranslator, body: &[u8]) -> WireResult<Option<
             }
         }
         let (Some(client_ser), true) = (client_ser, client_index != 0xFF) else {
+            x.notes
+                .push("an entity data field the client's release does not have was removed");
             continue;
         };
         out.put_u8(client_index);

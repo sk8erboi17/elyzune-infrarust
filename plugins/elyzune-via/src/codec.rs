@@ -285,7 +285,66 @@ pub fn components_of(x: &mut Xc<'_>, patch: &mut Tag, item: &str) {
     if !sign.is_empty() {
         fold_sign(&mut out, sign, item);
     }
+    if x.dir == Dir::S2c && x.t.client == Proto::V777 {
+        unfold_sign_entries(&mut out);
+    }
     *entries = out;
+}
+
+/// The reverse of [`fold_sign`], for a 26.3 client: a sign item's text and
+/// wax leave the 26.2 `block_entity_data` (`tag`, of block entity type
+/// `kind`) for the components a 26.3 item carries them in, as a 26.3
+/// server's `SignBlockEntity.collectImplicitComponents` sets them and
+/// `removeComponentsFromTag` takes them out of the data. Returns the
+/// components in codec form (the `SignText` compound, which is the same in
+/// both releases; `{}` for the unit `waxed`) and whether anything but the
+/// `id` is left of the data. Nothing is taken from another block entity.
+pub fn unfold_sign(kind: &str, tag: &mut Tag) -> (Vec<(&'static str, Tag)>, bool) {
+    let mut parts = Vec::new();
+    if !matches!(kind, "minecraft:sign" | "minecraft:hanging_sign") {
+        return (parts, true);
+    }
+    if let Some(front) = tag.remove("front_text") {
+        parts.push(("minecraft:sign_text_front", front));
+    }
+    if let Some(back) = tag.remove("back_text") {
+        parts.push(("minecraft:sign_text_back", back));
+    }
+    // An unwaxed sign has no `waxed` component (26.3 sets it only when
+    // waxed); the flag goes from the data either way.
+    if matches!(tag.remove("is_waxed"), Some(Tag::Byte(waxed)) if waxed != 0) {
+        parts.push(("minecraft:waxed", Tag::Compound(Vec::new())));
+    }
+    let rest = match tag {
+        Tag::Compound(entries) => entries.iter().any(|(key, _)| key.as_slice() != b"id"),
+        _ => true,
+    };
+    (parts, rest)
+}
+
+/// [`unfold_sign`] on a codec-form patch: the parts become keys of their
+/// own, and `block_entity_data` goes when only its `id` is left.
+fn unfold_sign_entries(out: &mut Vec<(Vec<u8>, Tag)>) {
+    const KEY: &[u8] = b"minecraft:block_entity_data";
+    let Some(index) = out.iter().position(|(key, _)| key.as_slice() == KEY) else {
+        return;
+    };
+    let Some(data) = out.get_mut(index).map(|(_, data)| data) else {
+        return;
+    };
+    let Some(kind) = owned_str(data.get("id")).map(|id| qualified(&id).into_owned()) else {
+        return;
+    };
+    let (parts, rest) = unfold_sign(&kind, data);
+    if parts.is_empty() {
+        return;
+    }
+    if !rest {
+        out.remove(index);
+    }
+    for (name, value) in parts {
+        out.push((name.as_bytes().to_vec(), value));
+    }
 }
 
 /// Puts 26.3 sign components into the 26.2 `block_entity_data` of the item,

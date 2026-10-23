@@ -50,13 +50,14 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
+use infrarust_api::command::{CommandContext, CommandHandler, CommandSpec};
 use infrarust_api::error::PluginError;
 use infrarust_api::event::bus::EventBusExt;
 use infrarust_api::event::{BoxFuture, EventPriority};
 use infrarust_api::events::proxy::ProxyPingEvent;
 use infrarust_api::filter::{ProtocolTranslator, ProtocolTranslatorFactory, TranslatorInit};
 use infrarust_api::plugin::{Plugin, PluginContext, PluginMetadata};
-use infrarust_api::types::ProtocolVersion;
+use infrarust_api::types::{ClickEvent, Component, ProtocolVersion};
 use serde::Deserialize;
 
 use crate::generated::Proto;
@@ -73,6 +74,10 @@ pub struct ViaConfig {
     /// Empty means every server: the Elyzune network has no other backend.
     #[serde(default)]
     pub servers: Vec<String>,
+    /// Public source of the proxy distributed to these players. When set,
+    /// `/source` offers the URL without a permission or a backend command.
+    #[serde(default)]
+    pub source_url: Option<String>,
 }
 
 const DEFAULT_CONFIG: &str = "\
@@ -132,6 +137,21 @@ impl ProtocolTranslatorFactory for ViaFactory {
 #[derive(Default)]
 pub struct ElyzuneViaPlugin;
 
+struct SourceCommand(String);
+
+impl CommandHandler for SourceCommand {
+    fn execute<'a>(&'a self, ctx: CommandContext) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            ctx.source.send_message(
+                Component::text(&self.0)
+                    .color("#88C0E8")
+                    .underlined()
+                    .click(ClickEvent::OpenUrl(self.0.clone())),
+            );
+        })
+    }
+}
+
 impl Plugin for ElyzuneViaPlugin {
     fn metadata(&self) -> PluginMetadata {
         PluginMetadata::new(PLUGIN_ID, "Elyzune Via", env!("CARGO_PKG_VERSION"))
@@ -145,6 +165,24 @@ impl Plugin for ElyzuneViaPlugin {
     ) -> BoxFuture<'a, Result<(), PluginError>> {
         Box::pin(async move {
             let config = load_config(&ctx.data_dir().join("config.toml")).await?;
+            if let Some(url) = &config.source_url {
+                if !url.starts_with("https://")
+                    || url.len() <= 8
+                    || url.chars().any(char::is_whitespace)
+                {
+                    return Err(PluginError::InitFailed(
+                        "elyzune-via: source_url must be an HTTPS URL".to_owned(),
+                    ));
+                }
+                ctx.command_manager()
+                    .register(
+                        CommandSpec::new("source"),
+                        Box::new(SourceCommand(url.clone())),
+                    )
+                    .map_err(|error| {
+                        PluginError::InitFailed(format!("elyzune-via: /source: {error}"))
+                    })?;
+            }
             let registry = ctx.codec_filters().ok_or_else(|| {
                 PluginError::InitFailed("elyzune-via needs the codec filter capability".to_owned())
             })?;
@@ -238,6 +276,7 @@ mod tests {
     fn a_server_list_limits_translation() {
         let factory = ViaFactory::new(&ViaConfig {
             servers: vec!["elyzune".to_owned()],
+            ..ViaConfig::default()
         });
         assert!(factory.create(&init(774, "elyzune")).is_some());
         assert!(factory.create(&init(774, "other")).is_none());
@@ -247,5 +286,24 @@ mod tests {
     fn the_default_config_parses() {
         let config: ViaConfig = toml::from_str(DEFAULT_CONFIG).unwrap();
         assert!(config.servers.is_empty());
+        assert!(config.source_url.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_source_offer_is_clickable_without_staff_permission() {
+        use infrarust_api::test_util::{MockPlayer, command_context, player_source};
+
+        let url = "https://github.com/sk8erboi17/elyzune-infrarust";
+        let player = MockPlayer::new(1, "Visitor").into_arc();
+        SourceCommand(url.to_owned())
+            .execute(command_context(player_source(&player), "source", ""))
+            .await;
+        let messages = player.messages();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].to_plain(), url);
+        assert_eq!(
+            messages[0].style.click.as_deref(),
+            Some(&ClickEvent::OpenUrl(url.to_owned()))
+        );
     }
 }

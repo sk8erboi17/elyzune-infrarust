@@ -15,10 +15,12 @@
 //! # Missing ids
 //!
 //! A registry entry with no equivalent on the other side ([`Xerr::Absent`]) is
-//! not an error of the stream. Containers decide what it means: a list skips
-//! the element, an optional becomes empty, a holder of a sound event becomes
-//! an inline sound by name, and anything else propagates up to the component,
-//! which is then removed from the item.
+//! not an error of the stream. Containers decide what it means: a list or a
+//! map skips the element, a holder set leaves the id out, an optional becomes
+//! empty, a holder of a sound event becomes an inline sound by name, and
+//! anything else propagates up to the component, which is then removed from
+//! the item. Every such loss leaves a note, which the packet's handler logs
+//! once per connection: nothing is dropped silently.
 
 use crate::generated::Proto;
 use crate::generated::registries::Reg;
@@ -173,6 +175,10 @@ pub struct Xc<'t> {
     /// notices (a component dropped, split, merged or reshaped); see
     /// `hashed.rs`. Callers that care reset it before a stack.
     pub hash_changed: bool,
+    /// The server item id a serverbound patch's hash backup recorded
+    /// (`hashed::strip_backup`), for the creative slot to undo a stand-in.
+    /// Callers that care reset it before a stack.
+    pub backup_item: Option<u32>,
 }
 
 impl<'t> Xc<'t> {
@@ -189,6 +195,7 @@ impl<'t> Xc<'t> {
             notes: Vec::new(),
             identity: false,
             hash_changed: false,
+            backup_item: None,
         }
     }
 
@@ -314,7 +321,12 @@ impl<'t> Xc<'t> {
                     let mark = body.len();
                     match self.value(elem, r, &mut body) {
                         Ok(()) => kept += 1,
-                        Err(Xerr::Absent(_)) => body.truncate(mark),
+                        Err(Xerr::Absent(_)) => {
+                            body.truncate(mark);
+                            self.notes.push(
+                                "a list element with no equivalent on the other side was removed",
+                            );
+                        }
                         Err(e) => return Err(e),
                     }
                 }
@@ -329,7 +341,11 @@ impl<'t> Xc<'t> {
                             out.put_bool(true);
                             out.put_bytes(&body);
                         }
-                        Err(Xerr::Absent(_)) => out.put_bool(false),
+                        Err(Xerr::Absent(_)) => {
+                            out.put_bool(false);
+                            self.notes
+                                .push("an optional value with no equivalent on the other side was left empty");
+                        }
                         Err(e) => return Err(e),
                     }
                 } else {
@@ -355,7 +371,12 @@ impl<'t> Xc<'t> {
                         .and_then(|()| self.value(value, r, &mut body));
                     match pair {
                         Ok(()) => kept += 1,
-                        Err(Xerr::Absent(_)) => body.truncate(mark),
+                        Err(Xerr::Absent(_)) => {
+                            body.truncate(mark);
+                            self.notes.push(
+                                "a map entry with no equivalent on the other side was removed",
+                            );
+                        }
                         Err(e) => return Err(e),
                     }
                 }
@@ -440,8 +461,11 @@ impl<'t> Xc<'t> {
         let mut ids = Vec::with_capacity(count.min(1024));
         for _ in 0..count {
             let id = Self::read_id(r)?;
-            if let Some(mapped) = self.map_id(reg, id) {
-                ids.push(mapped);
+            match self.map_id(reg, id) {
+                Some(mapped) => ids.push(mapped),
+                None => self
+                    .notes
+                    .push("a holder set id with no equivalent on the other side was removed"),
             }
         }
         out.put_len(ids.len() + 1);

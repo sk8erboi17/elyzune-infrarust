@@ -132,6 +132,38 @@ fn one(packets: Vec<(PlayCb, Vec<u8>)>, kind: PlayCb) -> Vec<u8> {
     packets.into_iter().next().unwrap().1
 }
 
+/// The `custom_data` a translated slot stack carries when its server-side
+/// hashes are backed up (`elyzune_via::hashed`, "Telling apart stacks the
+/// client sees as one"): created by the translator, holding the server's
+/// item id, the server hashes the client cannot reproduce by server
+/// component id, and the server's removed component ids.
+fn backup_tag(server_item: i32, hashes: &[(i32, i32)], removed: &[i32]) -> elyzune_via::nbt::Tag {
+    use elyzune_via::nbt::Tag;
+    let mut original = vec![(b"id".to_vec(), Tag::Int(server_item))];
+    for (ty, hash) in hashes {
+        original.push((ty.to_string().into_bytes(), Tag::Int(*hash)));
+    }
+    original.push((b"removed".to_vec(), Tag::IntArray(removed.to_vec())));
+    Tag::Compound(vec![
+        (b"elyzune-via|custom_data".to_vec(), Tag::Byte(1)),
+        (
+            b"elyzune-via|original_hashes".to_vec(),
+            Tag::Compound(original),
+        ),
+    ])
+}
+
+/// [`backup_tag`]'s network NBT and the hash a client claims for it: what
+/// every release's `HashOps` makes of the tag, pinned against the jar by
+/// `hashed::tests::nbt_matches_the_jar_vector`.
+fn backup(server_item: i32, hashes: &[(i32, i32)], removed: &[i32]) -> (Vec<u8>, i32) {
+    let tag = backup_tag(server_item, hashes, removed);
+    let mut value = Vec::new();
+    tag.write(&mut value);
+    let key = elyzune_via::hashed::as_int(elyzune_via::hashed::nbt(&tag).unwrap());
+    (value, key)
+}
+
 fn nbt_string(s: &str) -> Vec<u8> {
     let mut v = vec![8u8];
     v.extend_from_slice(&u16::try_from(s.len()).unwrap().to_be_bytes());
@@ -662,9 +694,20 @@ fn sword_slot(item: i32, name: i32, dyed: i32, ench: i32, dye: Option<i32>) -> V
 fn item_and_component_ids() {
     // registries.json: diamond_sword 936/937/964/1050; custom_name 6 and
     // enchantments 13 everywhere; dyed_color 42/44/44/47; dye -/43/43/46.
+    // 1.21.11 has no dye: the stack is sent without it and with the
+    // server's dye hash backed up in a created custom_data (component 0);
+    // DyeColor 14 is "red", HashOps string "red" = -1939582294 (an
+    // independent Python transcription of HashOps).
     let body = sword_slot(964, 6, 44, 13, Some(43));
+    let mut without_dye = sword_slot(936, 6, 42, 13, None);
+    // Added count 3 -> 4 (byte 7: window, state, slot, count, item 936 are
+    // 1 + 1 + 2 + 1 + 2 bytes), then custom_data appended.
+    assert_eq!(without_dye[7], 3);
+    without_dye[7] = 4;
+    without_dye.put_varint(0);
+    without_dye.put_bytes(&backup(964, &[(43, -1_939_582_294)], &[]).0);
     for (client, expected) in [
-        (774, sword_slot(936, 6, 42, 13, None)),
+        (774, without_dye),
         (775, sword_slot(937, 6, 44, 13, Some(43))),
         (777, sword_slot(1050, 6, 47, 13, Some(46))),
     ] {
@@ -1142,6 +1185,619 @@ fn hashed_stacks_from_26_3() {
 }
 
 #[test]
+fn a_rewritten_hover_claim_keeps_the_server_hash_and_refuses_a_wrong_claim() {
+    use elyzune_via::nbt::Tag;
+
+    let slot = |item, entity: &str| {
+        let mut body = Vec::new();
+        body.put_varint(0);
+        body.put_varint(1);
+        body.put_i16(36);
+        body.put_varint(1);
+        body.put_varint(item);
+        body.put_varint(1);
+        body.put_varint(0);
+        body.put_varint(6);
+        Tag::Compound(vec![
+            (b"text".to_vec(), Tag::string("Pergamena")),
+            (
+                b"hover_event".to_vec(),
+                Tag::Compound(vec![
+                    (b"action".to_vec(), Tag::string("show_entity")),
+                    (b"id".to_vec(), Tag::string(entity)),
+                    (b"uuid".to_vec(), Tag::IntArray(vec![1, 2, 3, 4])),
+                ]),
+            ),
+        ])
+        .write(&mut body);
+        body
+    };
+    // A claim: custom_name 6 with `hash`, and custom_data 0 with `key` when
+    // the client holds one.
+    let click = |item, hash, key: Option<i32>| {
+        let mut body = Vec::new();
+        body.put_varint(0);
+        body.put_varint(1);
+        body.put_i16(36);
+        body.put_i8(0);
+        body.put_varint(0);
+        body.put_varint(1);
+        body.put_i16(36);
+        body.put_bool(true);
+        body.put_varint(item);
+        body.put_varint(1);
+        body.put_varint(1 + i32::from(key.is_some()));
+        body.put_varint(6);
+        body.put_i32(hash);
+        if let Some(key) = key {
+            body.put_varint(0);
+            body.put_i32(key);
+        }
+        body.put_varint(0);
+        body.put_bool(false);
+        body
+    };
+    // Independent hashes from the official 26.2 jar, ItemData.java's
+    // "custom_name wire hover" vectors. Slime is the older clients' stand-in:
+    // their copy carries the server's name hash backed up in a created
+    // custom_data, whose hash is the claim's key.
+    let server_hash = -429_717_846;
+    let (value, key) = backup(964, &[(6, server_hash)], &[]);
+    let with_backup = |item, entity| {
+        let mut body = slot(item, entity);
+        // Added count 1 -> 2 (window, state, slot, count, two-byte item).
+        assert_eq!(body[7], 1);
+        body[7] = 2;
+        body.put_varint(0);
+        body.put_bytes(&value);
+        body
+    };
+    for (client, item, entity, client_hash, key) in [
+        (774, 936, "minecraft:slime", -570_653_298, Some(key)),
+        (775, 937, "minecraft:slime", -570_653_298, Some(key)),
+        (777, 1050, "minecraft:sulfur_cube", server_hash, None),
+    ] {
+        let mut translator = play(client);
+        assert_eq!(
+            one(
+                cb(
+                    &mut translator,
+                    client,
+                    PlayCb::ContainerSetSlot,
+                    slot(964, "minecraft:sulfur_cube")
+                ),
+                PlayCb::ContainerSetSlot
+            ),
+            if key.is_some() {
+                with_backup(item, entity)
+            } else {
+                slot(item, entity)
+            },
+            "{client}"
+        );
+        assert_eq!(
+            sb(
+                &mut translator,
+                client,
+                PlaySb::ContainerClick,
+                click(item, client_hash, key)
+            ),
+            vec![(PlaySb::ContainerClick, click(964, server_hash, None))],
+            "{client}"
+        );
+        // A wrong name claim is not answered from the record: it reaches the
+        // server renumbered, backup hash and all, and is corrected there.
+        let wrong = client_hash ^ 1;
+        assert_eq!(
+            sb(
+                &mut translator,
+                client,
+                PlaySb::ContainerClick,
+                click(item, wrong, key)
+            ),
+            vec![(PlaySb::ContainerClick, click(964, wrong, key))],
+            "{client}"
+        );
+    }
+}
+
+/// Two server stacks the translation makes identical on the client (a
+/// component the client lacks dropped, a stand-in next to the item it
+/// stands in for): each is sent with its own backup, so a claim about
+/// either is answered with that stack's server hashes however often the
+/// player alternates between them. Without the backup both claims are the
+/// same bytes and one of the two stacks is resent on every click.
+#[test]
+fn stacks_the_client_sees_as_one_keep_their_own_server_hashes() {
+    // 776 ids (registries.json 26.2): paper 1057, cinnabar_bricks 48,
+    // cut_red_sandstone 599, filled_map 1133, stone 1, dirt 55;
+    // sulfur_cube_content 78, map_color 45, custom_data 0 everywhere.
+    // Server hashes from an independent Python transcription of HashOps:
+    // sulfur cube content {id: stone} 725422587, {id: dirt} -1897882262;
+    // map colour 0x123456 287990503, 0x654321 2055888784.
+    let set_slot =
+        |slot: i16, item: i32, component: Option<(i32, &[u8])>, backup: Option<&[u8]>| {
+            let mut body = Vec::new();
+            body.put_varint(0);
+            body.put_varint(1);
+            body.put_i16(slot);
+            body.put_varint(if item == 48 || item == 599 || item == 571 || item == 572 {
+                16
+            } else {
+                1
+            });
+            body.put_varint(item);
+            body.put_varint(i32::from(component.is_some()) + i32::from(backup.is_some()));
+            body.put_varint(0);
+            if let Some((ty, value)) = component {
+                body.put_varint(ty);
+                body.put_bytes(value);
+            }
+            if let Some(backup) = backup {
+                body.put_varint(0);
+                body.put_bytes(backup);
+            }
+            body
+        };
+    let click = |slot: i16, item: i32, count: i32, claims: &[(i32, i32)]| {
+        let mut body = Vec::new();
+        body.put_varint(0);
+        body.put_varint(1);
+        body.put_i16(slot);
+        body.put_i8(0);
+        body.put_varint(0);
+        body.put_varint(1);
+        body.put_i16(slot);
+        body.put_bool(true);
+        body.put_varint(item);
+        body.put_varint(count);
+        body.put_len(claims.len());
+        for (ty, hash) in claims {
+            body.put_varint(*ty);
+            body.put_i32(*hash);
+        }
+        body.put_varint(0);
+        body.put_bool(false);
+        body
+    };
+    let stone: &[u8] = &[1, 1, 0, 0];
+    let dirt: &[u8] = &[55, 1, 0, 0];
+    let (stone_hash, dirt_hash) = (725_422_587, -1_897_882_262);
+    let first_map = 0x0012_3456_i32.to_be_bytes();
+    let second_map = 0x0065_4321_i32.to_be_bytes();
+    let (first_map_hash, second_map_hash) = (287_990_503, 2_055_888_784);
+
+    // Sulfur cube content before 26.2: two papers, plain paper on the
+    // client, told apart by their backups.
+    for (client, paper) in [(774, 1028), (775, 1029)] {
+        let mut t = play(client);
+        let (stone_backup, stone_key) = backup(1057, &[(78, stone_hash)], &[]);
+        let (dirt_backup, dirt_key) = backup(1057, &[(78, dirt_hash)], &[]);
+        assert_ne!(stone_key, dirt_key);
+        for (slot, value, backup) in [(36, stone, &stone_backup), (37, dirt, &dirt_backup)] {
+            assert_eq!(
+                one(
+                    cb(
+                        &mut t,
+                        client,
+                        PlayCb::ContainerSetSlot,
+                        set_slot(slot, 1057, Some((78, value)), None)
+                    ),
+                    PlayCb::ContainerSetSlot
+                ),
+                set_slot(slot, paper, None, Some(backup)),
+                "{client} slot {slot}"
+            );
+        }
+        for (slot, key, hash) in [
+            (36, stone_key, stone_hash),
+            (37, dirt_key, dirt_hash),
+            (36, stone_key, stone_hash),
+            (37, dirt_key, dirt_hash),
+        ] {
+            assert_eq!(
+                sb(
+                    &mut t,
+                    client,
+                    PlaySb::ContainerClick,
+                    click(slot, paper, 1, &[(0, key)])
+                ),
+                vec![(PlaySb::ContainerClick, click(slot, 1057, 1, &[(78, hash)]))],
+                "{client} slot {slot}"
+            );
+        }
+    }
+
+    // Cinnabar bricks before 26.2 are cut red sandstone with a backup; the
+    // real cut red sandstone beside them has none and is claimed as itself.
+    for (client, sandstone) in [(774, 571), (775, 572)] {
+        let mut t = play(client);
+        let (cinnabar_backup, cinnabar_key) = backup(48, &[], &[]);
+        assert_eq!(
+            one(
+                cb(
+                    &mut t,
+                    client,
+                    PlayCb::ContainerSetSlot,
+                    set_slot(36, 48, None, None)
+                ),
+                PlayCb::ContainerSetSlot
+            ),
+            set_slot(36, sandstone, None, Some(&cinnabar_backup)),
+        );
+        assert_eq!(
+            one(
+                cb(
+                    &mut t,
+                    client,
+                    PlayCb::ContainerSetSlot,
+                    set_slot(37, 599, None, None)
+                ),
+                PlayCb::ContainerSetSlot
+            ),
+            set_slot(37, sandstone, None, None),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                sb(
+                    &mut t,
+                    client,
+                    PlaySb::ContainerClick,
+                    click(36, sandstone, 16, &[(0, cinnabar_key)])
+                ),
+                vec![(PlaySb::ContainerClick, click(36, 48, 16, &[]))],
+                "{client} cinnabar"
+            );
+            assert_eq!(
+                sb(
+                    &mut t,
+                    client,
+                    PlaySb::ContainerClick,
+                    click(37, sandstone, 16, &[])
+                ),
+                vec![(PlaySb::ContainerClick, click(37, 599, 16, &[]))],
+                "{client} cut red sandstone"
+            );
+        }
+    }
+
+    // 26.3 has no map colour: two filled maps of different colours.
+    let mut t = play(777);
+    let (first_backup, first_key) = backup(1133, &[(45, first_map_hash)], &[]);
+    let (second_backup, second_key) = backup(1133, &[(45, second_map_hash)], &[]);
+    assert_ne!(first_key, second_key);
+    for (slot, value, backup) in [
+        (36, &first_map, &first_backup),
+        (37, &second_map, &second_backup),
+    ] {
+        assert_eq!(
+            one(
+                cb(
+                    &mut t,
+                    777,
+                    PlayCb::ContainerSetSlot,
+                    set_slot(slot, 1133, Some((45, value)), None)
+                ),
+                PlayCb::ContainerSetSlot
+            ),
+            set_slot(slot, 1238, None, Some(backup)),
+        );
+    }
+    for (slot, key, hash) in [
+        (36, first_key, first_map_hash),
+        (37, second_key, second_map_hash),
+        (36, first_key, first_map_hash),
+    ] {
+        assert_eq!(
+            sb(
+                &mut t,
+                777,
+                PlaySb::ContainerClick,
+                click(slot, 1238, 1, &[(0, key)])
+            ),
+            vec![(PlaySb::ContainerClick, click(slot, 1133, 1, &[(45, hash)]))],
+            "777 map slot {slot}"
+        );
+    }
+    // 26.3 keeps sulfur cube content: nothing to back up, the claim crosses
+    // renumbered (paper 1145, sulfur_cube_content 80).
+    assert_eq!(
+        one(
+            cb(
+                &mut t,
+                777,
+                PlayCb::ContainerSetSlot,
+                set_slot(38, 1057, Some((78, stone)), None)
+            ),
+            PlayCb::ContainerSetSlot
+        ),
+        set_slot(38, 1145, Some((80, stone)), None),
+    );
+}
+
+/// Two server stacks whose backups are the same bytes: the same rewritten
+/// name (a sulfur cube's hover, a slime's before 26.2), one of them with a
+/// lore the client sees as it is. The backup lists only what the client
+/// cannot reproduce, so both hash alike; each keeps its own record through
+/// the client's component ids, and a click on either, in any order, is
+/// answered with its own server stack.
+#[test]
+fn stacks_sharing_a_backup_keep_their_own_records() {
+    use elyzune_via::nbt::Tag;
+    let hover = |entity: &str| {
+        Tag::Compound(vec![
+            (b"text".to_vec(), Tag::string("Pergamena")),
+            (
+                b"hover_event".to_vec(),
+                Tag::Compound(vec![
+                    (b"action".to_vec(), Tag::string("show_entity")),
+                    (b"id".to_vec(), Tag::string(entity)),
+                    (b"uuid".to_vec(), Tag::IntArray(vec![1, 2, 3, 4])),
+                ]),
+            ),
+        ])
+    };
+    let mut lore = Vec::new();
+    lore.put_varint(1);
+    Tag::string("via-fixture").write(&mut lore);
+    // custom_name 6 and lore 11 in both releases; paper 1057 / 1028.
+    let set_slot = |slot: i16, item: i32, entity: &str, with_lore: bool, backup: Option<&[u8]>| {
+        let mut body = Vec::new();
+        body.put_varint(0);
+        body.put_varint(1);
+        body.put_i16(slot);
+        body.put_varint(1);
+        body.put_varint(item);
+        body.put_varint(1 + i32::from(with_lore) + i32::from(backup.is_some()));
+        body.put_varint(0);
+        body.put_varint(6);
+        hover(entity).write(&mut body);
+        if with_lore {
+            body.put_varint(11);
+            body.put_bytes(&lore);
+        }
+        if let Some(backup) = backup {
+            body.put_varint(0);
+            body.put_bytes(backup);
+        }
+        body
+    };
+    let click = |slot: i16, item: i32, claims: &[(i32, i32)]| {
+        let mut body = Vec::new();
+        body.put_varint(0);
+        body.put_varint(1);
+        body.put_i16(slot);
+        body.put_i8(0);
+        body.put_varint(0);
+        body.put_varint(1);
+        body.put_i16(slot);
+        body.put_bool(true);
+        body.put_varint(item);
+        body.put_varint(1);
+        body.put_len(claims.len());
+        for (ty, hash) in claims {
+            body.put_varint(*ty);
+            body.put_i32(*hash);
+        }
+        body.put_varint(0);
+        body.put_bool(false);
+        body
+    };
+    // ItemData.java's "custom_name wire hover" vectors; the lore's hash is
+    // the client's own, crossing as it is.
+    let (sulfur, slime_hash, lore_hash) = (-429_717_846, -570_653_298, 12_345);
+    let (value, key) = backup(1057, &[(6, sulfur)], &[]);
+    let mut t = play(774);
+    for (slot, with_lore) in [(36, true), (37, false)] {
+        assert_eq!(
+            one(
+                cb(
+                    &mut t,
+                    774,
+                    PlayCb::ContainerSetSlot,
+                    set_slot(slot, 1057, "minecraft:sulfur_cube", with_lore, None)
+                ),
+                PlayCb::ContainerSetSlot
+            ),
+            set_slot(slot, 1028, "minecraft:slime", with_lore, Some(&value)),
+            "slot {slot}"
+        );
+    }
+    for _ in 0..2 {
+        assert_eq!(
+            sb(
+                &mut t,
+                774,
+                PlaySb::ContainerClick,
+                click(36, 1028, &[(6, slime_hash), (11, lore_hash), (0, key)])
+            ),
+            vec![(
+                PlaySb::ContainerClick,
+                click(36, 1057, &[(6, sulfur), (11, lore_hash)])
+            )],
+            "with lore"
+        );
+        assert_eq!(
+            sb(
+                &mut t,
+                774,
+                PlaySb::ContainerClick,
+                click(37, 1028, &[(6, slime_hash), (0, key)])
+            ),
+            vec![(PlaySb::ContainerClick, click(37, 1057, &[(6, sulfur)]))],
+            "without lore"
+        );
+    }
+}
+
+/// A 1.21.11 component whose layout differs from 26.1's (here the
+/// instrument's `EitherHolder`) in a stack that also needs a backup: the
+/// stack is re-read whole to add the backup, so its bytes must come back
+/// complete, and the claim about the instrument keeps the client's hash
+/// (the persistent codec ignores the network wrapper).
+#[test]
+fn a_reshaped_1_21_11_component_survives_the_backup() {
+    let instrument = (0.."00000c656c797a756e653a686f726e0040e0000043800000080005436f726e6f".len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(
+                &"00000c656c797a756e653a686f726e0040e0000043800000080005436f726e6f"[i..i + 2],
+                16,
+            )
+            .unwrap()
+        })
+        .collect::<Vec<u8>>();
+    let stone: &[u8] = &[1, 1, 0, 0];
+    let mut server = Vec::new();
+    server.put_varint(0);
+    server.put_varint(1);
+    server.put_i16(36);
+    server.put_varint(1);
+    server.put_varint(1057);
+    server.put_varint(2);
+    server.put_varint(0);
+    server.put_varint(61);
+    server.put_bytes(&instrument);
+    server.put_varint(78);
+    server.put_bytes(stone);
+    // 1.21.11: paper 1028, instrument 59 behind EitherHolder's `true`, no
+    // sulfur cube content, the backup (custom_data 0) holding its hash.
+    let (value, key) = backup(1057, &[(78, 725_422_587)], &[]);
+    let mut client = Vec::new();
+    client.put_varint(0);
+    client.put_varint(1);
+    client.put_i16(36);
+    client.put_varint(1);
+    client.put_varint(1028);
+    client.put_varint(2);
+    client.put_varint(0);
+    client.put_varint(59);
+    client.put_bool(true);
+    client.put_bytes(&instrument);
+    client.put_varint(0);
+    client.put_bytes(&value);
+    let mut t = play(774);
+    assert_eq!(
+        one(
+            cb(&mut t, 774, PlayCb::ContainerSetSlot, server),
+            PlayCb::ContainerSetSlot
+        ),
+        client
+    );
+    let click = |item: i32, claims: &[(i32, i32)]| {
+        let mut body = Vec::new();
+        body.put_varint(0);
+        body.put_varint(1);
+        body.put_i16(36);
+        body.put_i8(0);
+        body.put_varint(0);
+        body.put_varint(1);
+        body.put_i16(36);
+        body.put_bool(true);
+        body.put_varint(item);
+        body.put_varint(1);
+        body.put_len(claims.len());
+        for (ty, hash) in claims {
+            body.put_varint(*ty);
+            body.put_i32(*hash);
+        }
+        body.put_varint(0);
+        body.put_bool(false);
+        body
+    };
+    // The official instrument hash (ItemData.java "instrument inline
+    // variable sound"): -140489936 on both sides.
+    assert_eq!(
+        sb(
+            &mut t,
+            774,
+            PlaySb::ContainerClick,
+            click(1028, &[(59, -140_489_936), (0, key)])
+        ),
+        vec![(
+            PlaySb::ContainerClick,
+            click(1057, &[(61, -140_489_936), (78, 725_422_587)])
+        )]
+    );
+}
+
+/// A creative client sends a translated stack back whole, backup and all:
+/// the backup never reaches the server, and a `custom_data` the translator
+/// created goes with it.
+#[test]
+fn creative_slot_drops_the_hash_backup() {
+    use elyzune_via::nbt::Tag;
+    let creative = |item: i32, custom_data: Option<&Tag>| {
+        let mut b = Vec::new();
+        b.put_i16(36);
+        b.put_varint(1);
+        b.put_varint(item);
+        b.put_varint(i32::from(custom_data.is_some()));
+        b.put_varint(0);
+        if let Some(tag) = custom_data {
+            let mut value = Vec::new();
+            tag.write(&mut value);
+            b.put_varint(0);
+            b.put_len(value.len());
+            b.put_bytes(&value);
+        }
+        b
+    };
+    let mut t = play(774);
+    // Created by the translator for cinnabar bricks (48), shown as cut red
+    // sandstone (571): the whole component goes, and the server gets its
+    // cinnabar back, as ViaBackwards restores the id it backed up.
+    let created = backup_tag(48, &[], &[]);
+    assert_eq!(
+        sb(
+            &mut t,
+            774,
+            PlaySb::SetCreativeModeSlot,
+            creative(571, Some(&created))
+        ),
+        vec![(PlaySb::SetCreativeModeSlot, creative(48, None))]
+    );
+    // Real cut red sandstone stays itself, and a backup naming an item the
+    // client was not shown as this one restores nothing.
+    assert_eq!(
+        sb(
+            &mut t,
+            774,
+            PlaySb::SetCreativeModeSlot,
+            creative(571, None)
+        ),
+        vec![(PlaySb::SetCreativeModeSlot, creative(599, None))]
+    );
+    let foreign = backup_tag(1057, &[], &[]);
+    assert_eq!(
+        sb(
+            &mut t,
+            774,
+            PlaySb::SetCreativeModeSlot,
+            creative(571, Some(&foreign))
+        ),
+        vec![(PlaySb::SetCreativeModeSlot, creative(599, None))]
+    );
+    // The server's own custom_data with the backup added: only the backup
+    // goes.
+    let mut merged = Tag::Compound(vec![(b"ely".to_vec(), Tag::Int(7))]);
+    merged.insert(
+        "elyzune-via|original_hashes",
+        Tag::Compound(vec![(b"id".to_vec(), Tag::Int(1057))]),
+    );
+    let own = Tag::Compound(vec![(b"ely".to_vec(), Tag::Int(7))]);
+    assert_eq!(
+        sb(
+            &mut t,
+            774,
+            PlaySb::SetCreativeModeSlot,
+            creative(1028, Some(&merged))
+        ),
+        vec![(PlaySb::SetCreativeModeSlot, creative(1057, Some(&own)))]
+    );
+}
+
+#[test]
 fn creative_slot_from_1_21_11() {
     // set_creative_mode_slot uses delimited components; diamond_sword 936 ->
     // 964, dyed_color 42 -> 44.
@@ -1264,4 +1920,229 @@ fn timed_translators_count_packets_per_direction() {
 
     // The environment is not set for the test run: `new` keeps no timing.
     assert!(ViaTranslator::new(Proto::V774, 4).timing().is_none());
+}
+
+#[test]
+fn inline_instrument_and_trim_claims_use_each_official_client_codec() {
+    let bytes = |hex: &str| -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap())
+            .collect()
+    };
+    // A slot of one component, plus the backup custom_data (component 0)
+    // a translated stack carries.
+    let slot = |item, kind, value: &[u8], backup: Option<&[u8]>| {
+        let mut body = Vec::new();
+        body.put_varint(0);
+        body.put_varint(1);
+        body.put_i16(36);
+        body.put_varint(1);
+        body.put_varint(item);
+        body.put_varint(1 + i32::from(backup.is_some()));
+        body.put_varint(0);
+        body.put_varint(kind);
+        body.put_bytes(value);
+        if let Some(backup) = backup {
+            body.put_varint(0);
+            body.put_bytes(backup);
+        }
+        body
+    };
+    // A claim of one component, plus the backup's hash when the client
+    // holds one.
+    let click = |item, kind, hash, key: Option<i32>| {
+        let mut body = Vec::new();
+        body.put_varint(0);
+        body.put_varint(1);
+        body.put_i16(36);
+        body.put_i8(0);
+        body.put_varint(0);
+        body.put_varint(1);
+        body.put_i16(36);
+        body.put_bool(true);
+        body.put_varint(item);
+        body.put_varint(1);
+        body.put_varint(1 + i32::from(key.is_some()));
+        body.put_varint(kind);
+        body.put_i32(hash);
+        if let Some(key) = key {
+            body.put_varint(0);
+            body.put_i32(key);
+        }
+        body.put_varint(0);
+        body.put_bool(false);
+        body
+    };
+    let mut translators = [play(774), play(775), play(777)];
+    let mut remembered = Vec::new();
+    // Component ids: Mojang registries.json, each release. Values/hashes:
+    // official 26.2/26.3 ItemData.java runs. 774/775 keep the 776 persistent
+    // codec; 774's EitherHolder adds only a network presence byte.
+    for (
+        name,
+        server_type,
+        client_types,
+        server_hex,
+        server_hash,
+        client_hex,
+        hash_777,
+        either_774,
+    ) in [
+        (
+            "instrument inline variable sound",
+            61,
+            [59, 61, 63],
+            "00000c656c797a756e653a686f726e0040e0000043800000080005436f726e6f",
+            -140489936,
+            "00000c656c797a756e653a686f726e0040e000004380000000080005436f726e6f",
+            -140489936,
+            true,
+        ),
+        (
+            "instrument inline fixed sound",
+            61,
+            [59, 61, 63],
+            "00000c656c797a756e653a686f726e01430000003fc00000420000000a080005636f6c6f7200072338384330453808000474657874000c53706164612064656c205265010004626f6c64010100066974616c69630000",
+            -221739880,
+            "00000c656c797a756e653a686f726e01430000003fc0000042000000000a080005636f6c6f7200072338384330453808000474657874000c53706164612064656c205265010004626f6c64010100066974616c69630000",
+            -221739880,
+            true,
+        ),
+        (
+            "provides_trim_material inline",
+            62,
+            [60, 62, 64],
+            "00076d69746872696c000800074d69746872696c",
+            -219312053,
+            "00166d696e6563726166743a7472696d2f6d69746872696c0800074d69746872696c",
+            -342855194,
+            true,
+        ),
+        (
+            "provides_trim_material inline overrides",
+            62,
+            [60, 62, 64],
+            "00076d69746872696c010e6d696e6563726166743a69726f6e0e6d69746872696c5f6461726b65720a080005636f6c6f7200072338384330453808000474657874000c53706164612064656c205265010004626f6c64010100066974616c69630000",
+            1643090981,
+            "00166d696e6563726166743a7472696d2f6d69746872696c0a080005636f6c6f7200072338384330453808000474657874000c53706164612064656c205265010004626f6c64010100066974616c69630000",
+            -1168115561,
+            true,
+        ),
+        (
+            "trim inline",
+            56,
+            [54, 56, 58],
+            "00076d69746872696c000800074d69746872696c000d656c797a756e653a7370697265080005537069726500",
+            820957339,
+            "00166d696e6563726166743a7472696d2f6d69746872696c0800074d69746872696c000d656c797a756e653a7370697265080005537069726500",
+            1334830686,
+            false,
+        ),
+        (
+            "trim inline decal overrides",
+            56,
+            [54, 56, 58],
+            "00076d69746872696c010e6d696e6563726166743a69726f6e0e6d69746872696c5f6461726b65720a080005636f6c6f7200072338384330453808000474657874000c53706164612064656c205265010004626f6c64010100066974616c69630000000d656c797a756e653a73706972650a080005636f6c6f7200072338384330453808000474657874000c53706164612064656c205265010004626f6c64010100066974616c6963000001",
+            1287871806,
+            "00166d696e6563726166743a7472696d2f6d69746872696c0a080005636f6c6f7200072338384330453808000474657874000c53706164612064656c205265010004626f6c64010100066974616c69630000000d656c797a756e653a73706972650a080005636f6c6f7200072338384330453808000474657874000c53706164612064656c205265010004626f6c64010100066974616c6963000001",
+            -1089483449,
+            false,
+        ),
+    ] {
+        let server_value = bytes(server_hex);
+        for (index, (protocol, item)) in [(774, 936), (775, 937), (777, 1050)]
+            .into_iter()
+            .enumerate()
+        {
+            let translator = &mut translators[index];
+            let ty = client_types[index];
+            let mut client_value = if protocol == 777 {
+                bytes(client_hex)
+            } else {
+                server_value.clone()
+            };
+            if protocol == 774 && either_774 {
+                client_value.insert(0, 1);
+            }
+            let client_hash = if protocol == 777 {
+                hash_777
+            } else {
+                server_hash
+            };
+            // A value whose codec hash the translation changed (26.3's trim
+            // shapes) is sent with the server's hash backed up. One whose
+            // bytes changed but whose hash did not (1.21.11's EitherHolder
+            // byte, 26.3's instrument with no durability damage) crosses as
+            // it is, like the untouched ones: the client's claim already is
+            // the server's.
+            let (value, key) = backup(964, &[(server_type, server_hash)], &[]);
+            let key = (client_hash != server_hash).then_some(key);
+            assert_eq!(
+                one(
+                    cb(
+                        translator,
+                        protocol,
+                        PlayCb::ContainerSetSlot,
+                        slot(964, server_type, &server_value, None)
+                    ),
+                    PlayCb::ContainerSetSlot
+                ),
+                slot(item, ty, &client_value, key.map(|_| value.as_slice())),
+                "{protocol} {name} value"
+            );
+            assert_eq!(
+                sb(
+                    translator,
+                    protocol,
+                    PlaySb::ContainerClick,
+                    click(item, ty, client_hash, key)
+                ),
+                vec![(
+                    PlaySb::ContainerClick,
+                    click(964, server_type, server_hash, None)
+                )],
+                "{protocol} {name} correct claim"
+            );
+            let wrong = client_hash ^ 1;
+            assert_eq!(
+                sb(
+                    translator,
+                    protocol,
+                    PlaySb::ContainerClick,
+                    click(item, ty, wrong, key)
+                ),
+                vec![(PlaySb::ContainerClick, click(964, server_type, wrong, key))],
+                "{protocol} {name} wrong claim"
+            );
+            remembered.push((
+                index,
+                protocol,
+                item,
+                ty,
+                server_type,
+                client_hash,
+                server_hash,
+                key,
+            ));
+        }
+    }
+    // Several inventory slots can have the same component types with
+    // different values. A newer trim must not shadow the earlier material's
+    // expected client hash merely because their patch IDs are equal.
+    for (index, protocol, item, ty, server_type, client_hash, server_hash, key) in remembered {
+        assert_eq!(
+            sb(
+                &mut translators[index],
+                protocol,
+                PlaySb::ContainerClick,
+                click(item, ty, client_hash, key)
+            ),
+            vec![(
+                PlaySb::ContainerClick,
+                click(964, server_type, server_hash, None)
+            )],
+            "{protocol} earlier value remains distinguishable: component {server_type}"
+        );
+    }
 }

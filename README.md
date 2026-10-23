@@ -61,6 +61,19 @@ cargo build --release -p infrarust
 
 Archives for macOS (`darwin`) and Windows, x86_64 and arm64, are on the [releases page](https://github.com/Shadowner/Infrarust/releases).
 
+This Elyzune fork is published at [sk8erboi17/elyzune-infrarust](https://github.com/sk8erboi17/elyzune-infrarust).
+Its toolchain is pinned in `rust-toolchain.toml`. Build the Linux x86_64 proxy
+used by the Elyzune draft on Linux x86_64 with:
+
+```bash
+RUSTFLAGS='-C force-frame-pointers=yes' CARGO_INCREMENTAL=0 \
+  cargo build --locked --release -p infrarust --no-default-features \
+  --features default-plugins,libdeflater
+```
+
+The `elyzune/` directory contains the deployment configuration. Its via-plugin
+configuration enables `/source`, which offers players this fork's public source.
+
 ### Configure
 
 `infrarust.toml`:

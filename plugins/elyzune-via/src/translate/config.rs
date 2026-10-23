@@ -274,7 +274,13 @@ pub fn registry_data(t: &mut ViaTranslator, body: &[u8]) -> WireResult<Option<By
     }
     let dropped = count - kept;
     t.conn.dynamic.insert(registry.clone(), reg);
+    // Declared, never silent (AGENTS.md): the once-per-connection warning
+    // names the kind of loss, the debug line which registry it was.
     if known.is_none() {
+        t.drop_unsupported(
+            "minecraft:registry_data",
+            "a registry the client's release does not have was not sent",
+        );
         tracing::debug!(
             registry,
             "elyzune-via: registry unknown to the client, not sent"
@@ -282,6 +288,10 @@ pub fn registry_data(t: &mut ViaTranslator, body: &[u8]) -> WireResult<Option<By
         return Ok(None);
     }
     if dropped > 0 {
+        t.drop_unsupported(
+            "minecraft:registry_data",
+            "registry entries the client's release does not have were removed",
+        );
         tracing::debug!(
             registry,
             dropped,
@@ -428,6 +438,11 @@ mod tests {
         assert_eq!(reg.s2c(0), Some(0));
         assert_eq!(reg.s2c(1), None);
         assert_eq!(reg.s2c(2), Some(1));
+        // Declared, not silent (inventory PLAT-V15).
+        assert!(t.reported(
+            "minecraft:registry_data",
+            "registry entries the client's release does not have were removed"
+        ));
     }
 
     #[test]
@@ -436,6 +451,10 @@ mod tests {
         let body = registry("minecraft:world_clock", &["minecraft:overworld"]);
         assert!(registry_data(&mut t, &body).unwrap().is_none());
         assert_eq!(t.conn.dyn_s2c("minecraft:world_clock", 0), None);
+        assert!(t.reported(
+            "minecraft:registry_data",
+            "a registry the client's release does not have was not sent"
+        ));
     }
 
     #[test]

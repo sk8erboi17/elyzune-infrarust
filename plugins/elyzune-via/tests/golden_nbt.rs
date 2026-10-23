@@ -153,6 +153,30 @@ fn nbt(t: &Tag) -> Vec<u8> {
     v
 }
 
+/// The `custom_data` value a translated slot stack is sent with when its
+/// server-side hashes are backed up (`elyzune_via::hashed`, "Telling apart
+/// stacks the client sees as one"), created by the translator: the
+/// server's item, the server hashes the client cannot reproduce by server
+/// component id, the server's removed ids. Returns its network NBT and the
+/// hash a client claims for it (`HashOps` over NBT, pinned against the jar
+/// by `hashed::tests::nbt_matches_the_jar_vector`).
+fn backup(server_item: i32, hashes: &[(i32, i32)], removed: &[i32]) -> (Vec<u8>, i32) {
+    let mut original = vec![(b"id".to_vec(), Tag::Int(server_item))];
+    for (ty, hash) in hashes {
+        original.push((ty.to_string().into_bytes(), Tag::Int(*hash)));
+    }
+    original.push((b"removed".to_vec(), Tag::IntArray(removed.to_vec())));
+    let tag = Tag::Compound(vec![
+        (b"elyzune-via|custom_data".to_vec(), Tag::Byte(1)),
+        (
+            b"elyzune-via|original_hashes".to_vec(),
+            Tag::Compound(original),
+        ),
+    ]);
+    let key = elyzune_via::hashed::as_int(elyzune_via::hashed::nbt(&tag).unwrap());
+    (nbt(&tag), key)
+}
+
 /// `{text, hover_event: show_entity <entity>}`.
 fn entity_hover(text: &str, entity: &str) -> Tag {
     c(vec![
@@ -1058,14 +1082,29 @@ fn item_components_carrying_nbt_and_26_3_animations() {
             bed_component(client),
             typed(campfire(client), &campfire_tag(dandelion(client))),
         );
-        let expected = if client == 777 {
-            slot(
+        // 26.3's split swing needs no backup (its two animations are
+        // claimed as the one swing), nor does a block entity whose type
+        // was only renumbered (26.1). 1.21.11's campfire holds the
+        // dandelion shown for 26.1's golden dandelion, so its data hashes
+        // differently and the server's hash is backed up: 801797658 for
+        // {id: campfire, Items: [{Slot: 0b, id: golden_dandelion, count:
+        // 1}]} (an independent Python transcription of HashOps).
+        let expected = match client {
+            777 => slot(
                 sword(client),
                 &[(40, swing()), (41, swing()), data],
                 &[40, 41],
-            )
-        } else {
-            slot(sword(client), &[(40, swing()), data], &[40])
+            ),
+            774 => slot(
+                sword(client),
+                &[
+                    (40, swing()),
+                    data,
+                    (0, backup(964, &[(60, 801_797_658)], &[40]).0),
+                ],
+                &[40],
+            ),
+            _ => slot(sword(client), &[(40, swing()), data], &[40]),
         };
         assert_eq!(got, expected, "{client}");
     }
@@ -1131,6 +1170,106 @@ fn creative_sign_items_from_26_3_fold_into_block_entity_data() {
         expected.put_bytes(value);
     }
     assert_eq!(got[0].1, expected);
+}
+
+/// 26.2 container slot: an oak sign whose block_entity_data holds its front
+/// text and wax reaches 26.3 as sign_text_front and waxed, without the data
+/// (the reverse of the creative fold above: what a 26.3 server's
+/// `collectImplicitComponents` and `removeComponentsFromTag` send), so a
+/// 26.3 client sees the stack as its own release writes it. Data with more
+/// than the text keeps the rest.
+///
+/// Ids as above; hanging sign block entity 8 (776).
+#[test]
+fn sign_items_for_26_3_carry_their_text_as_components() {
+    let line = |text: &str| c(vec![("text", s(text))]);
+    let front = c(vec![
+        (
+            "messages",
+            l(vec![line("Hi"), line(""), line(""), line("")]),
+        ),
+        ("color", s("red")),
+        ("has_glowing_text", Tag::Byte(1)),
+    ]);
+    let server = slot(
+        1016,
+        &[(
+            60,
+            typed(
+                7,
+                &c(vec![
+                    ("front_text", front.clone()),
+                    ("is_waxed", Tag::Byte(1)),
+                ]),
+            ),
+        )],
+        &[],
+    );
+    let mut t = play(777);
+    let got = one(
+        cb(&mut t, 777, PlayCb::ContainerSetSlot, server),
+        PlayCb::ContainerSetSlot,
+    );
+    let mut text = Vec::new();
+    for value in ["Hi", "", "", ""] {
+        text.put_bytes(&nbt(&line(value)));
+    }
+    text.put_bool(false);
+    text.put_varint(14); // red
+    text.put_bool(true);
+    // The server's data (no client counterpart left) is backed up with its
+    // hash, -476928617 (see `claims_about_26_3_sign_stacks_reach_the_server_
+    // with_its_data_hash`).
+    assert_eq!(
+        got,
+        slot(
+            1102,
+            &[
+                (118, text.clone()),
+                (120, Vec::new()),
+                (0, backup(1016, &[(60, -476_928_617)], &[]).0)
+            ],
+            &[]
+        )
+    );
+
+    // An unwaxed sign whose data also holds a field the components do not
+    // take keeps that field in its block_entity_data.
+    let server = slot(
+        1016,
+        &[(
+            60,
+            typed(
+                7,
+                &c(vec![
+                    ("front_text", front),
+                    ("is_waxed", Tag::Byte(0)),
+                    ("allow_op_features", Tag::Byte(1)),
+                ]),
+            ),
+        )],
+        &[],
+    );
+    let got = one(
+        cb(&mut t, 777, PlayCb::ContainerSetSlot, server),
+        PlayCb::ContainerSetSlot,
+    );
+    // The server's whole data hashes to 1520026718 ({id: sign, front_text,
+    // is_waxed: 0b, allow_op_features: 1b}, an independent Python
+    // transcription of HashOps); the client's rest hashes otherwise.
+    let rest = typed(7, &c(vec![("allow_op_features", Tag::Byte(1))]));
+    assert_eq!(
+        got,
+        slot(
+            1102,
+            &[
+                (118, text),
+                (62, rest),
+                (0, backup(1016, &[(60, 1_520_026_718)], &[]).0)
+            ],
+            &[]
+        )
+    );
 }
 
 // ---- registry entries sent inline --------------------------------------------
@@ -1271,24 +1410,26 @@ fn inline_enchantments_take_the_clients_predicate_and_condition_shapes() {
     }
 }
 
-#[test]
-fn an_inline_entry_the_client_cannot_read_is_left_out_and_ids_shift() {
-    // 26.3 has no `value_check` condition: the entry is removed for 26.3
-    // only, and the next entry takes its id there.
-    let custom = c(vec![(
+/// An enchantment whose damage effect requires `condition`.
+fn requiring(condition: Tag) -> Tag {
+    c(vec![(
         "effects",
         c(vec![(
             "minecraft:damage",
-            l(vec![c(vec![(
-                "requirements",
-                c(vec![
-                    ("condition", s("minecraft:value_check")),
-                    ("value", Tag::Int(1)),
-                    ("range", Tag::Int(1)),
-                ]),
-            )])]),
+            l(vec![c(vec![("requirements", condition)])]),
         )]),
-    )]);
+    )])
+}
+
+#[test]
+fn an_inline_entry_the_client_cannot_read_is_left_out_and_ids_shift() {
+    // 26.3 has no `reference` condition (it resolves predicates through a
+    // registry the backend never sends): the entry is removed for 26.3
+    // only, and the next entry takes its id there.
+    let custom = requiring(c(vec![
+        ("condition", s("minecraft:reference")),
+        ("name", s("elyzune:night")),
+    ]));
     let server = registry(
         "minecraft:enchantment",
         &[("elyzune:odd", Some(custom)), ("minecraft:sharpness", None)],
@@ -1312,6 +1453,79 @@ fn an_inline_entry_the_client_cannot_read_is_left_out_and_ids_shift() {
             .dynamic("minecraft:enchantment")
             .unwrap();
         assert_eq!((reg.s2c(0), reg.s2c(1)), (Some(0), Some(1)), "{client}");
+    }
+}
+
+/// 26.2 `value_check` tests `value.getInt` (Java's `Math.round` of the
+/// float) against an int range: for 26.3 it is `int_value_check` with the
+/// same constants, a point or a line. A computed provider has no faithful
+/// 26.3 form and the entry is left out, as before.
+#[test]
+fn constant_value_checks_reach_26_3_as_int_value_checks() {
+    let check = |value: Tag, range: Tag| {
+        requiring(c(vec![
+            ("condition", s("minecraft:value_check")),
+            ("value", value),
+            ("range", range),
+        ]))
+    };
+    let server = registry(
+        "minecraft:enchantment",
+        &[
+            ("elyzune:point", Some(check(Tag::Float(2.5), Tag::Int(3)))),
+            (
+                "elyzune:line",
+                Some(check(
+                    c(vec![
+                        ("type", s("minecraft:constant")),
+                        ("value", Tag::Float(-2.5)),
+                    ]),
+                    c(vec![("min", Tag::Float(-2.4)), ("max", Tag::Int(7))]),
+                )),
+            ),
+            (
+                "elyzune:scored",
+                Some(check(
+                    c(vec![
+                        ("type", s("minecraft:score")),
+                        ("target", c(vec![("type", s("minecraft:context"))])),
+                        ("score", s("kills")),
+                    ]),
+                    Tag::Int(1),
+                )),
+            ),
+        ],
+    );
+    let (_, got) = registry_to(777, server.clone());
+    let expected = |value: i32, test: Tag| {
+        requiring(c(vec![
+            ("value", Tag::Int(value)),
+            ("test", test),
+            ("type", s("minecraft:int_value_check")),
+        ]))
+    };
+    assert_eq!(
+        got.unwrap(),
+        registry(
+            "minecraft:enchantment",
+            &[
+                // Math.round(2.5f) = 3, Math.round(-2.5f) = -2,
+                // Math.round(-2.4f) = -2.
+                ("elyzune:point", Some(expected(3, Tag::Int(3)))),
+                (
+                    "elyzune:line",
+                    Some(expected(
+                        -2,
+                        c(vec![("min", Tag::Int(-2)), ("max", Tag::Int(7))]),
+                    )),
+                ),
+            ],
+        )
+    );
+    // The other releases keep 26.2's condition as it is.
+    for client in [774, 775] {
+        let (_, got) = registry_to(client, server.clone());
+        assert_eq!(got.unwrap(), server, "{client}");
     }
 }
 
@@ -1513,14 +1727,23 @@ fn claims_about_translated_stacks_reach_the_server_as_its_own_stacks() {
     let name = nbt(&s("Brick"));
     let custom_name_hash = 1_894_353_999; // any: same codec form, kept
 
-    // 1.21.11 holds cinnabar bricks (26.2: 48) as cut red sandstone (571):
-    // the claim must name the server's item again.
+    // 1.21.11 holds cinnabar bricks (26.2: 48) as cut red sandstone (571)
+    // with a backup naming the cinnabar: the claim, which carries the
+    // backup's hash under custom_data (0), must name the server's item
+    // again. Without that hash it is a claim about real cut red sandstone.
+    let (_, cinnabar) = backup(48, &[], &[]);
+    let got = claim_after(
+        774,
+        slot(48, &[(6, name.clone())], &[]),
+        click(571, &[(6, custom_name_hash), (0, cinnabar)]),
+    );
+    assert_eq!(got, click(48, &[(6, custom_name_hash)]));
     let got = claim_after(
         774,
         slot(48, &[(6, name.clone())], &[]),
         click(571, &[(6, custom_name_hash)]),
     );
-    assert_eq!(got, click(48, &[(6, custom_name_hash)]));
+    assert_eq!(got, click(599, &[(6, custom_name_hash)]));
 
     // 26.1 has no sulfur_cube_content (26.2: 78): the server's component
     // and its hash come back. paper: 1029 (26.1) / 1057 (26.2).
@@ -1529,7 +1752,12 @@ fn claims_about_translated_stacks_reach_the_server_as_its_own_stacks() {
     sulfur.put_varint(1);
     sulfur.put_varint(0);
     sulfur.put_varint(0);
-    let got = claim_after(775, slot(1057, &[(78, sulfur)], &[]), click(1029, &[]));
+    let (_, key) = backup(1057, &[(78, 725_422_587)], &[]);
+    let got = claim_after(
+        775,
+        slot(1057, &[(78, sulfur)], &[]),
+        click(1029, &[(0, key)]),
+    );
     assert_eq!(got, click(1057, &[(78, 725_422_587)]));
 
     // 26.3 pot decorations (26.3: 76) hash another codec form; the server's
@@ -1540,10 +1768,11 @@ fn claims_about_translated_stacks_reach_the_server_as_its_own_stacks() {
     for item in [1477, 1054, 1054, 1054] {
         pot.put_varint(item);
     }
+    let (_, key) = backup(347, &[(74, 570_053_514)], &[]);
     let got = claim_after(
         777,
         slot(347, &[(74, pot)], &[]),
-        click(392, &[(76, 12345)]),
+        click(392, &[(76, 12345), (0, key)]),
     );
     assert_eq!(got, click(347, &[(74, 570_053_514)]));
 
@@ -1555,6 +1784,40 @@ fn claims_about_translated_stacks_reach_the_server_as_its_own_stacks() {
         click(1050, &[(40, 777), (41, 777)]),
     );
     assert_eq!(got, click(964, &[(40, 777)]));
+}
+
+/// A 26.3 sign stack carries its text as components where the server's
+/// carries block_entity_data (`sign_items_for_26_3_carry_their_text_as_
+/// components`): a claim about it comes back as the server's stack with the
+/// data's hash computed. `{id: "minecraft:sign", front_text: {messages:
+/// [{text: "Hi"}, {text: ""} x3], color: "red", has_glowing_text: 1b},
+/// is_waxed: 1b}` hashes to -476928617 by NbtOps types (an independent
+/// Python transcription of `HashOps`, checked against the jar's vector in
+/// `hashed::tests::nbt_matches_the_jar_vector`).
+#[test]
+fn claims_about_26_3_sign_stacks_reach_the_server_with_its_data_hash() {
+    let line = |text: &str| c(vec![("text", s(text))]);
+    let data = c(vec![
+        (
+            "front_text",
+            c(vec![
+                (
+                    "messages",
+                    l(vec![line("Hi"), line(""), line(""), line("")]),
+                ),
+                ("color", s("red")),
+                ("has_glowing_text", Tag::Byte(1)),
+            ]),
+        ),
+        ("is_waxed", Tag::Byte(1)),
+    ]);
+    let (_, key) = backup(1016, &[(60, -476_928_617)], &[]);
+    let got = claim_after(
+        777,
+        slot(1016, &[(60, typed(7, &data))], &[]),
+        click(1102, &[(118, 4242), (120, -982_207_288), (0, key)]),
+    );
+    assert_eq!(got, click(1016, &[(60, -476_928_617)]));
 }
 
 #[test]

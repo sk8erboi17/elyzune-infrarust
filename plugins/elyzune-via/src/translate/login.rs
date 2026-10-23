@@ -44,7 +44,9 @@ pub fn json_text(t: &ViaTranslator, body: &Bytes) -> WireResult<Bytes> {
     let mut r = Reader::new(body);
     let text = r.string()?;
     let mut x = Xc::new(t, Dir::S2c);
-    let Some(rewritten) = crate::text::json(&mut x, text) else {
+    let rewritten = crate::text::json(&mut x, text);
+    declare(t, "minecraft:login_disconnect", &x.notes);
+    let Some(rewritten) = rewritten else {
         return Ok(body.clone());
     };
     let mut out = Vec::with_capacity(rewritten.len() + 3);
@@ -63,9 +65,25 @@ pub fn status_response(t: &ViaTranslator, packet: &RawPacket) -> Option<Bytes> {
     let mut status: serde_json::Value = serde_json::from_str(text).ok()?;
     let description = status.get("description")?.to_string();
     let mut x = Xc::new(t, Dir::S2c);
-    let rewritten = crate::text::json(&mut x, &description)?;
+    let rewritten = crate::text::json(&mut x, &description);
+    declare(t, "minecraft:status_response", &x.notes);
+    let rewritten = rewritten?;
     status["description"] = serde_json::from_str(&rewritten).ok()?;
     let mut out = Vec::new();
     out.put_str(&serde_json::to_string(&status).ok()?);
     Some(out.into())
+}
+
+/// Logs what a text rewrite left out. These packets come once per connection
+/// (and the translator is only borrowed here), so the warning is written
+/// directly rather than through the once-per-connection log.
+fn declare(t: &ViaTranslator, packet: &'static str, notes: &[&'static str]) {
+    for reason in notes {
+        tracing::warn!(
+            connection = t.connection_id,
+            packet,
+            reason,
+            "elyzune-via: packet not translated"
+        );
+    }
 }

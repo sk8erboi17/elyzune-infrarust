@@ -28,7 +28,9 @@
 //!              `type_specific: {type}`... instead of 26.2's map of
 //!              namespaced sub-predicates
 //! 26.3         loot conditions dispatch on `type` (was `condition`);
-//!              `block_state_property` became `match_block`; damage source
+//!              `block_state_property` became `match_block`; `value_check`
+//!              became `int_value_check` (constants only, see
+//!              `condition_777`); `reference` has no form; damage source
 //!              tag tests name the tag with `#`; block state providers and
 //!              block states were renamed (`simple_state_provider` with
 //!              `{Name, Properties}` -> `{id, properties}`); bed rules
@@ -335,9 +337,15 @@ fn condition(x: &mut Xc<'_>, tag: &mut Tag) -> bool {
 }
 
 /// 26.3 dispatches loot conditions on `type`, renamed `block_state_property`
-/// to `match_block` (`{block, properties}` -> `{blocks, state}`), and
-/// replaced `value_check` and `reference` with conditions of another shape;
-/// those two have no direct form and make the entry unrepresentable.
+/// to `match_block` (`{block, properties}` -> `{blocks, state}`), and split
+/// `value_check` by number type. 26.2's `value_check` tests `value.getInt`
+/// (the provider's float rounded as Java's `Math.round`) against an
+/// `IntRange`, which is 26.3's `int_value_check {value, test}` with the same
+/// numbers when they are constants (26.3 reads an inline int as a constant
+/// provider, no registry needed). A computed provider (score, storage,
+/// uniform...) has no faithful 26.3 form, and neither has `reference`: 26.3
+/// resolves predicates through a registry the backend never sends. Those
+/// make the entry unrepresentable.
 fn condition_777(tag: &mut Tag, kind: &str) -> bool {
     tag.remove("condition");
     match kind {
@@ -351,7 +359,16 @@ fn condition_777(tag: &mut Tag, kind: &str) -> bool {
             }
             true
         }
-        "minecraft:value_check" | "minecraft:reference" => {
+        "minecraft:value_check" => {
+            if int_value_check(tag) {
+                tag.insert("type", Tag::string("minecraft:int_value_check"));
+                true
+            } else {
+                tag.insert("type", Tag::string(kind));
+                false
+            }
+        }
+        "minecraft:reference" => {
             tag.insert("type", Tag::string(kind));
             false
         }
@@ -360,6 +377,76 @@ fn condition_777(tag: &mut Tag, kind: &str) -> bool {
             true
         }
     }
+}
+
+/// `value_check`'s `{value, range}` as `int_value_check`'s `{value, test}`
+/// when every number is a constant (see [`condition_777`]); false, with
+/// `tag` unchanged, otherwise. The range is a point (an int) or a line
+/// (`{min?, max?}`) in both releases.
+fn int_value_check(tag: &mut Tag) -> bool {
+    let Some(value) = tag.get("value").and_then(constant_int) else {
+        return false;
+    };
+    let test = match tag.get("range") {
+        Some(Tag::Compound(bounds)) => {
+            let mut line = Vec::new();
+            for (key, bound) in bounds {
+                if !matches!(key.as_slice(), b"min" | b"max") {
+                    return false;
+                }
+                let Some(bound) = constant_int(bound) else {
+                    return false;
+                };
+                line.push((key.clone(), Tag::Int(bound)));
+            }
+            Tag::Compound(line)
+        }
+        Some(point) => match constant_int(point) {
+            Some(point) => Tag::Int(point),
+            None => return false,
+        },
+        None => return false,
+    };
+    tag.remove("range");
+    tag.insert("value", Tag::Int(value));
+    tag.insert("test", test);
+    true
+}
+
+/// A 26.2 number provider that is a constant (a bare number or `{type:
+/// constant, value}`), as the int 26.2's `NumberProvider.getInt` makes of it:
+/// `Math.round(float)`, which is `floor(x + 0.5)` saturated to the int range.
+/// `None` for any other provider.
+fn constant_int(tag: &Tag) -> Option<i32> {
+    let number = match tag {
+        Tag::Compound(_) => {
+            let kind = tag.get("type").and_then(Tag::as_str)?;
+            if crate::codec::qualified(kind) != "minecraft:constant" {
+                return None;
+            }
+            tag.get("value")?
+        }
+        other => other,
+    };
+    let value = match *number {
+        Tag::Byte(v) => f64::from(v),
+        Tag::Short(v) => f64::from(v),
+        Tag::Int(v) => return Some(v),
+        Tag::Float(v) => f64::from(v),
+        Tag::Double(v) => v,
+        _ => return None,
+    };
+    if !value.is_finite() {
+        return None;
+    }
+    let rounded = (value + 0.5)
+        .floor()
+        .clamp(f64::from(i32::MIN), f64::from(i32::MAX));
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "an integral value clamped to the i32 range"
+    )]
+    Some(rounded as i32)
 }
 
 /// An entity predicate. 26.2 writes it as a map of namespaced sub-predicates

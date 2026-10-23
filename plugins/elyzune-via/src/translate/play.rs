@@ -171,8 +171,8 @@ pub fn clientbound(
                 }
                 item::slot_stack(x, &mut r, o, &mut records)
             })?;
-            for record in records {
-                t.conn.sent_stacks.record(record);
+            for (key, record) in records {
+                t.conn.sent_stacks.record(key, record);
             }
             translated
         }
@@ -341,22 +341,30 @@ pub fn serverbound(
             t.emit_play_sb(PlaySb::SpectatorAction, o.into(), out);
             return Ok(());
         }
-        PlaySb::ContainerClick => transcode(t, kind.name(), Dir::C2s, |x, o| {
-            // container id, state id, i16 slot, i8 button, VarInt click type,
-            // Map<i16 slot, HashedStack>, HashedStack carried.
-            let mut r = Reader::new(&body);
-            o.put_varint(r.varint()?);
-            o.put_varint(r.varint()?);
-            o.put_bytes(r.bytes(3)?);
-            o.put_varint(r.varint()?);
-            let n = r.len()?;
-            o.put_len(n);
-            for _ in 0..n {
-                o.put_bytes(r.bytes(2)?);
-                item::hashed_stack(x, &mut r, o)?;
+        PlaySb::ContainerClick => {
+            // Records that answered a claim, refreshed once translated.
+            let mut answered = Vec::new();
+            let translated = transcode(t, kind.name(), Dir::C2s, |x, o| {
+                // container id, state id, i16 slot, i8 button, VarInt click
+                // type, Map<i16 slot, HashedStack>, HashedStack carried.
+                let mut r = Reader::new(&body);
+                o.put_varint(r.varint()?);
+                o.put_varint(r.varint()?);
+                o.put_bytes(r.bytes(3)?);
+                o.put_varint(r.varint()?);
+                let n = r.len()?;
+                o.put_len(n);
+                for _ in 0..n {
+                    o.put_bytes(r.bytes(2)?);
+                    item::hashed_stack(x, &mut r, o, &mut answered)?;
+                }
+                item::hashed_stack(x, &mut r, o, &mut answered)
+            })?;
+            for key in &answered {
+                t.conn.sent_stacks.touch(key);
             }
-            item::hashed_stack(x, &mut r, o)
-        })?,
+            translated
+        }
         PlaySb::SetCreativeModeSlot => transcode(t, kind.name(), Dir::C2s, |x, o| {
             let mut r = Reader::new(&body);
             o.put_bytes(r.bytes(2)?);
@@ -879,5 +887,47 @@ fn open_screen_777(t: &mut ViaTranslator, body: &Bytes, out: &mut TranslatorOutp
         o.put_i16(slot);
         o.put_i16(value);
         t.emit_play_cb(PlayCb::ContainerSetData, o.into(), out);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    /// Inventory PLAT-V14: 26.2's `minecraft:friction_modifier` does not exist
+    /// before 26.2. The 1.21.11 client gets the other attribute of the packet,
+    /// and the left-out one is declared once for the connection instead of
+    /// vanishing silently.
+    #[test]
+    fn an_attribute_the_client_lacks_is_left_out_and_declared() {
+        let mut t = ViaTranslator::new(Proto::V774, 1);
+        let health = id_of(Reg::Attribute, 776, "minecraft:max_health").unwrap();
+        let friction = id_of(Reg::Attribute, 776, "minecraft:friction_modifier").unwrap();
+        assert_eq!(
+            id_of(Reg::Attribute, 774, "minecraft:friction_modifier"),
+            None
+        );
+        let mut body = Vec::new();
+        body.put_varint(7);
+        body.put_len(2);
+        for (attribute, base) in [(health, 20.0_f64), (friction, 1.0)] {
+            body.put_varint(i32::try_from(attribute).unwrap());
+            body.put_bytes(&base.to_be_bytes());
+            body.put_len(0);
+        }
+        let mut out = TranslatorOutput::new();
+        clientbound(&mut t, PlayCb::UpdateAttributes, body.into(), &mut out).unwrap();
+        let sent: Vec<_> = out.take_to_client().collect();
+        assert_eq!(sent.len(), 1);
+        let mut r = Reader::new(&sent[0].data);
+        assert_eq!(r.varint().unwrap(), 7);
+        assert_eq!(r.len().unwrap(), 1, "only max_health reaches 1.21.11");
+        let client_health = id_of(Reg::Attribute, 774, "minecraft:max_health").unwrap();
+        assert_eq!(r.varint().unwrap(), i32::try_from(client_health).unwrap());
+        assert!(t.reported(
+            "minecraft:update_attributes",
+            "a list element with no equivalent on the other side was removed"
+        ));
     }
 }

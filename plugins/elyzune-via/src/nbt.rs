@@ -143,7 +143,22 @@ impl Tag {
 
     #[must_use]
     pub fn string(s: &str) -> Self {
-        Self::String(s.as_bytes().to_vec())
+        let mut bytes = Vec::with_capacity(s.len());
+        for unit in s.encode_utf16() {
+            match unit {
+                1..=0x7f => bytes.push(unit as u8),
+                0..=0x7ff => {
+                    bytes.push(0xc0 | (unit >> 6) as u8);
+                    bytes.push(0x80 | (unit & 0x3f) as u8);
+                }
+                _ => {
+                    bytes.push(0xe0 | (unit >> 12) as u8);
+                    bytes.push(0x80 | ((unit >> 6) & 0x3f) as u8);
+                    bytes.push(0x80 | (unit & 0x3f) as u8);
+                }
+            }
+        }
+        Self::String(bytes)
     }
 
     /// The value as a string, when it is an ASCII-compatible string tag.
@@ -375,6 +390,23 @@ mod tests {
         let mut r = Reader::new(&buf);
         skip(&mut r).unwrap();
         assert_eq!(r.rest(), b"tail");
+    }
+
+    #[test]
+    fn emitted_unicode_strings_match_the_official_modified_utf8_bytes() {
+        // ItemData.java's official custom_name modified UTF-8 vector.
+        let expected = [
+            8, 0, 15, 77, 117, 115, 105, 99, 97, 32, 0xed, 0xa0, 0xb4, 0xed, 0xb4, 0x9e, 0xc0, 0x80,
+        ];
+        let mut wire = Vec::new();
+        Tag::string("Musica 𝄞\0").write(&mut wire);
+        assert_eq!(wire, expected);
+        let mut reader = Reader::new(&wire);
+        let parsed = Tag::read(&mut reader).unwrap().unwrap();
+        assert!(reader.is_empty());
+        let mut unchanged = Vec::new();
+        parsed.write(&mut unchanged);
+        assert_eq!(unchanged, expected);
     }
 
     #[test]
