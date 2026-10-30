@@ -316,6 +316,12 @@ impl ViaTranslator {
 
     fn config_cb(&mut self, packet: RawPacket, out: &mut TranslatorOutput) {
         let Some(kind) = ConfigCb::from_id(Proto::V776, packet.packet_id) else {
+            let _packet = tracing::warn_span!(
+                "configuration_packet",
+                packet_id = packet.packet_id,
+                bytes = packet.data.len()
+            )
+            .entered();
             self.drop_unsupported("configuration", "unknown clientbound configuration packet");
             return;
         };
@@ -332,6 +338,12 @@ impl ViaTranslator {
 
     fn config_sb(&mut self, packet: RawPacket, out: &mut TranslatorOutput) {
         let Some(kind) = ConfigSb::from_id(self.client, packet.packet_id) else {
+            let _packet = tracing::warn_span!(
+                "configuration_packet",
+                packet_id = packet.packet_id,
+                bytes = packet.data.len()
+            )
+            .entered();
             self.drop_unsupported("configuration", "unknown serverbound configuration packet");
             return;
         };
