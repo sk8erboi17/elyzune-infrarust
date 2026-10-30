@@ -1312,46 +1312,12 @@ fn read_stack<'a>(
     proto: Proto,
     bytes: &'a [u8],
 ) -> Xresult<Option<RawStack<'a>>> {
-    let mut x = Xc::new(
-        t,
-        if proto == Proto::V776 {
-            Dir::S2c
-        } else {
-            Dir::C2s
-        },
-    );
     let mut r = Reader::new(bytes);
     if r.varint()? <= 0 {
         return Ok(None);
     }
     let item = read_u32(&mut r)?;
-    let added = r.len()?;
-    let removed = r.len()?;
-    let mut entries = Vec::with_capacity(added.min(64));
-    for _ in 0..added {
-        let ty = read_u32(&mut r)?;
-        let name = component_name(proto, ty)
-            .ok_or(Xerr::Wire(WireError::Malformed("unknown component type")))?;
-        let start = r.pos();
-        if proto == Proto::V774 && reshaped(Proto::V774, name) {
-            let mut sink = Vec::new();
-            x.with_identity(|x| reshape_774(x, name, &mut r, &mut sink))?;
-        } else {
-            let layout = component_layout(&x, name).ok_or(Xerr::Wire(WireError::Malformed(
-                "component without a layout",
-            )))?;
-            skip_value(&mut x, layout, &mut r)?;
-        }
-        entries.push(Entry {
-            ty,
-            name,
-            value: r.since(start),
-        });
-    }
-    let mut gone = Vec::with_capacity(removed.min(64));
-    for _ in 0..removed {
-        gone.push(read_u32(&mut r)?);
-    }
+    let (entries, gone) = read_patch(t, proto, &mut r)?;
     if !r.is_empty() {
         return Err(Xerr::Wire(WireError::Malformed(
             "bytes left after a stack's patch",
@@ -1362,6 +1328,51 @@ fn read_stack<'a>(
         added: entries,
         removed: gone,
     }))
+}
+
+/// The same patch layout belongs to slots and nested templates. Values borrow
+/// their bounded wire slices; walking a nested template never copies its tail.
+fn read_patch<'a>(
+    t: &crate::session::ViaTranslator,
+    proto: Proto,
+    r: &mut Reader<'a>,
+) -> Xresult<(Vec<Entry<'a>>, Vec<u32>)> {
+    let mut x = Xc::new(
+        t,
+        if proto == Proto::V776 {
+            Dir::S2c
+        } else {
+            Dir::C2s
+        },
+    );
+    let added = r.len()?;
+    let removed = r.len()?;
+    let mut entries = Vec::with_capacity(added.min(64));
+    for _ in 0..added {
+        let ty = read_u32(r)?;
+        let name = component_name(proto, ty)
+            .ok_or(Xerr::Wire(WireError::Malformed("unknown component type")))?;
+        let start = r.pos();
+        if proto == Proto::V774 && reshaped(Proto::V774, name) {
+            let mut sink = Vec::new();
+            x.with_identity(|x| reshape_774(x, name, r, &mut sink))?;
+        } else {
+            let layout = component_layout(&x, name).ok_or(Xerr::Wire(WireError::Malformed(
+                "component without a layout",
+            )))?;
+            skip_value(&mut x, layout, r)?;
+        }
+        entries.push(Entry {
+            ty,
+            name,
+            value: r.since(start),
+        });
+    }
+    let mut gone = Vec::with_capacity(removed.min(64));
+    for _ in 0..removed {
+        gone.push(read_u32(r)?);
+    }
+    Ok((entries, gone))
 }
 
 /// The record a later claim needs for a slot stack the server sent as
@@ -1428,6 +1439,8 @@ pub fn sent_record(
                 | "minecraft:provides_trim_material"
                 | "minecraft:trim"
                 | "minecraft:block_entity_data"
+                | "minecraft:use_remainder"
+                | "minecraft:sulfur_cube_content"
         ) && counterpart
             .and_then(|id| c_added.iter().find(|value| value.ty == id))
             .is_some_and(|value| value.value != entry.value);
@@ -1520,7 +1533,19 @@ fn value_hash(
     proto: Proto,
     entry: &Entry<'_>,
 ) -> crate::hashed::Claim {
+    value_hash_depth(t, proto, entry, 64)
+}
+
+fn value_hash_depth(
+    t: &crate::session::ViaTranslator,
+    proto: Proto,
+    entry: &Entry<'_>,
+    depth: usize,
+) -> crate::hashed::Claim {
     use crate::hashed::{Claim, as_int, int, list, map, string};
+    let Some(depth) = depth.checked_sub(1) else {
+        return Claim::Unknown;
+    };
     let mut r = Reader::new(entry.value);
     let hash = (|| -> WireResult<Option<u32>> {
         Ok(match entry.name {
@@ -1588,22 +1613,8 @@ fn value_hash(
                     .and_then(|reg| reg.names.get(id))
                     .map(|n| string(n))
             }
-            // ItemStackTemplate: {id, count unless 1}; a template with a
-            // component patch would need every component's codec.
-            "minecraft:sulfur_cube_content" => {
-                let item = read_wire_u32(&mut r)?;
-                let count = r.varint()?;
-                let (added, removed) = (r.varint()?, r.varint()?);
-                match name_of(Reg::Item, 776, item) {
-                    Some(name) if added == 0 && removed == 0 => {
-                        let mut fields = vec![(string("id"), string(name))];
-                        if count != 1 {
-                            fields.push((string("count"), int(count)));
-                        }
-                        Some(map(fields))
-                    }
-                    _ => None,
-                }
+            "minecraft:sulfur_cube_content" | "minecraft:use_remainder" => {
+                template_hash(t, proto, &mut r, depth)?
             }
             // `TypedEntityData`: the saved fields with the type's name put
             // back under `id`, through `CompoundTag.CODEC` (NBT by type).
@@ -1644,6 +1655,62 @@ fn value_hash(
         Ok(Some(h)) if r.is_empty() => Claim::Computed(as_int(h)),
         _ => Claim::Unknown,
     }
+}
+
+/// Persistent template record, including removal tombstones. Every recursive
+/// component shares the caller's budget, so a container cannot reset it.
+fn template_hash(
+    t: &crate::session::ViaTranslator,
+    proto: Proto,
+    r: &mut Reader<'_>,
+    depth: usize,
+) -> WireResult<Option<u32>> {
+    use crate::hashed::{Claim, int, map, string};
+    use std::collections::BTreeMap;
+    let (item, count) = if proto == Proto::V774 {
+        let count = r.varint()?;
+        (read_wire_u32(r)?, count)
+    } else {
+        (read_wire_u32(r)?, r.varint()?)
+    };
+    let Some(name) = name_of(Reg::Item, proto.number().unsigned_abs(), item) else {
+        return Ok(None);
+    };
+    if count <= 0 {
+        return Ok(None);
+    }
+    let (added, removed) =
+        read_patch(t, proto, r).map_err(|_| WireError::Malformed("template component patch"))?;
+    let mut patch = BTreeMap::new();
+    for entry in &added {
+        patch.insert(entry.name, Some(entry));
+    }
+    for ty in removed {
+        let Some(name) = component_name(proto, ty) else {
+            return Ok(None);
+        };
+        patch.insert(name, None);
+    }
+    let mut fields = vec![(string("id"), string(name))];
+    if count != 1 {
+        fields.push((string("count"), int(count)));
+    }
+    if !patch.is_empty() {
+        let mut components = Vec::with_capacity(patch.len());
+        for (name, entry) in patch {
+            match entry {
+                Some(entry) => {
+                    let Claim::Computed(hash) = value_hash_depth(t, proto, entry, depth) else {
+                        return Ok(None);
+                    };
+                    components.push((string(name), u32::from_ne_bytes(hash.to_ne_bytes())));
+                }
+                None => components.push((string(&format!("!{name}")), map(Vec::new()))),
+            }
+        }
+        fields.push((string("components"), map(components)));
+    }
+    Ok(Some(map(fields)))
 }
 
 fn hash_identifier(name: &str) -> u32 {
@@ -1935,6 +2002,24 @@ mod hash_tests {
         for (proto, name, hex, expected) in [
             (
                 Proto::V776,
+                "minecraft:sulfur_cube_content",
+                "01010000",
+                725422587,
+            ),
+            (
+                Proto::V776,
+                "minecraft:sulfur_cube_content",
+                "c4070201014e0101000003",
+                -1727006559,
+            ),
+            (
+                Proto::V776,
+                "minecraft:use_remainder",
+                "9008010000",
+                -943539315,
+            ),
+            (
+                Proto::V776,
                 "minecraft:custom_name",
                 "08000f4d757369636120eda0b4edb49ec080",
                 -1487372295,
@@ -2045,5 +2130,50 @@ mod hash_tests {
                 "{proto:?} {name}"
             );
         }
+    }
+
+    #[test]
+    fn nested_template_hashes_refuse_bad_counts_truncation_and_excessive_depth() {
+        let translator = crate::session::ViaTranslator::new(Proto::V775, 1);
+        let valid = [
+            0xc4, 0x07, 0x02, 0x01, 0x01, 0x4e, 0x01, 0x01, 0x00, 0x00, 0x03,
+        ];
+        for end in 0..valid.len() {
+            let entry = Entry {
+                ty: 78,
+                name: "minecraft:sulfur_cube_content",
+                value: &valid[..end],
+            };
+            assert_eq!(
+                server_hash(&translator, &entry),
+                crate::hashed::Claim::Unknown,
+                "prefix {end}"
+            );
+        }
+        let zero_count = [1, 0, 0, 0];
+        let entry = Entry {
+            ty: 78,
+            name: "minecraft:sulfur_cube_content",
+            value: &zero_count,
+        };
+        assert_eq!(
+            server_hash(&translator, &entry),
+            crate::hashed::Claim::Unknown
+        );
+        let mut nested = vec![1, 1, 0, 0];
+        for _ in 0..65 {
+            let mut outer = vec![1, 1, 1, 0, 78];
+            outer.extend_from_slice(&nested);
+            nested = outer;
+        }
+        let entry = Entry {
+            ty: 78,
+            name: "minecraft:sulfur_cube_content",
+            value: &nested,
+        };
+        assert_eq!(
+            server_hash(&translator, &entry),
+            crate::hashed::Claim::Unknown
+        );
     }
 }
