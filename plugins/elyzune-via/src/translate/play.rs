@@ -305,6 +305,8 @@ pub fn clientbound(
                 crate::debug::value_packet(x, &body, crate::debug::Prefix::Long, true, o)
             })?
         }
+        // The Servux metadata names the client's release (`servux`).
+        PlayCb::CustomPayload => Some(super::servux::custom_payload(client, body)?),
         PlayCb::DebugEntityValue => transcode(t, kind.name(), Dir::S2c, |x, o| {
             crate::debug::value_packet(x, &body, crate::debug::Prefix::VarInt, true, o)
         })?,

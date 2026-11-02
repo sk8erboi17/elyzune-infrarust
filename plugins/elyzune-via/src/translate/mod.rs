@@ -5,5 +5,6 @@ pub mod handshake;
 pub mod login;
 pub mod play;
 pub mod play777;
+pub mod servux;
 pub mod tags;
 pub mod text_packets;
