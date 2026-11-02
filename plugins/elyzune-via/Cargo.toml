@@ -23,6 +23,8 @@ toml = { workspace = true }
 tokio = { workspace = true, features = ["fs"] }
 tracing = { workspace = true }
 uuid = { workspace = true }
+# Axiom's tunnel frames are zstd-compressed (translate::axiom).
+zstd = "0.13.3"
 
 [dev-dependencies]
 infrarust-api = { workspace = true, features = ["test-util"] }

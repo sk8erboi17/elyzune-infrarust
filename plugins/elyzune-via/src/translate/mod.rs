@@ -1,5 +1,6 @@
 //! Per-state packet translation. `session` dispatches here by state.
 
+pub mod axiom;
 pub mod config;
 pub mod handshake;
 pub mod login;

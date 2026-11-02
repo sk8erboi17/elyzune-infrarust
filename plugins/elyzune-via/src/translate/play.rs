@@ -306,6 +306,12 @@ pub fn clientbound(
             })?
         }
         // The Servux metadata names the client's release (`servux`).
+        // The Servux metadata names the client's release (`servux`); Axiom's
+        // chunk responses come down in the client's ids (`axiom`).
+        PlayCb::CustomPayload if super::axiom::applies(client) => Some(super::axiom::clientbound(
+            t,
+            super::servux::custom_payload(client, body)?,
+        )?),
         PlayCb::CustomPayload => Some(super::servux::custom_payload(client, body)?),
         PlayCb::DebugEntityValue => transcode(t, kind.name(), Dir::S2c, |x, o| {
             crate::debug::value_packet(x, &body, crate::debug::Prefix::VarInt, true, o)
@@ -329,6 +335,13 @@ pub fn serverbound(
     out: &mut TranslatorOutput,
 ) -> WireResult<()> {
     let body: Option<Bytes> = match kind {
+        // Axiom's handshake and block packets go up as 26.2's (`axiom`).
+        PlaySb::CustomPayload if super::axiom::applies(t.client) => {
+            for payload in super::axiom::serverbound(t, &body)? {
+                t.emit_play_sb(kind, payload, out);
+            }
+            return Ok(());
+        }
         PlaySb::Interact if t.client == Proto::V774 => {
             interact_774(t, &body, out)?;
             return Ok(());

@@ -83,6 +83,8 @@ pub struct Conn {
     pub min_y: i16,
     /// Slot stacks sent changed in a way their hash notices (`hashed.rs`).
     pub sent_stacks: crate::hashed::SentStacks,
+    /// An Axiom tunnel frame being reassembled (`translate::axiom`).
+    pub axiom_tunnel: crate::translate::axiom::Tunnel,
 }
 
 impl Default for Conn {
@@ -96,6 +98,7 @@ impl Default for Conn {
             player_entity: 0,
             min_y: -64,
             sent_stacks: crate::hashed::SentStacks::default(),
+            axiom_tunnel: crate::translate::axiom::Tunnel::default(),
         }
     }
 }

@@ -53,7 +53,7 @@ const BIOME_ENTRIES: usize = 64;
 
 /// Which palette a container belongs to.
 #[derive(Clone, Copy)]
-enum Kind {
+pub(crate) enum Kind {
     Blocks,
     Biomes,
 }
@@ -97,7 +97,7 @@ pub trait IdRemap {
 }
 
 /// Positions of interesting ids within a container (beds, for 774/775).
-struct Watch<'a> {
+pub(crate) struct Watch<'a> {
     wanted: &'a dyn Fn(u32) -> bool,
     hit: &'a mut dyn FnMut(usize),
 }
@@ -105,7 +105,7 @@ struct Watch<'a> {
 /// Copies one paletted container, remapping its ids, and reports the entry
 /// indices whose id `watch` wants. Unpacking only happens when a wanted id
 /// can be present, so a section without beds costs a copy.
-fn container(
+pub(crate) fn container(
     kind: Kind,
     remap: &dyn IdRemap,
     r: &mut Reader<'_>,
@@ -209,7 +209,8 @@ fn pack(values: &[u32], bits: u8, out: &mut Vec<u8>) {
     }
 }
 
-struct BlockRemap<'a>(&'a ViaTranslator);
+/// Block states down to the client (also Axiom's chunk responses).
+pub(crate) struct BlockRemap<'a>(pub(crate) &'a ViaTranslator);
 
 impl IdRemap for BlockRemap<'_> {
     fn map(&self, id: u32) -> u32 {
