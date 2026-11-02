@@ -93,6 +93,105 @@ BLOCK_FALLBACK = {
     "minecraft:potted_golden_dandelion": "minecraft:potted_dandelion",
 }
 
+# Client blocks the 26.2 backend does not have, up to the closest 26.2 block:
+# what a 26.3 client may send in a block state field (Axiom's buffers and
+# single placements). Taken from ViaBackwards' mappings-26.3to26.2 block
+# states (the substitutes it shows a 26.2 client), so a block a builder
+# places reads back as what ViaBackwards would have shown. Property values
+# carry over wherever the substitute has a property of the same name.
+BLOCK_FALLBACK_UP = {
+    "minecraft:black_concrete_slab": "minecraft:blackstone_slab",
+    "minecraft:black_wool_slab": "minecraft:blackstone_slab",
+    "minecraft:black_concrete_stairs": "minecraft:blackstone_stairs",
+    "minecraft:black_wool_stairs": "minecraft:blackstone_stairs",
+    "minecraft:blue_concrete_slab": "minecraft:warped_slab",
+    "minecraft:blue_wool_slab": "minecraft:warped_slab",
+    "minecraft:blue_concrete_stairs": "minecraft:warped_stairs",
+    "minecraft:blue_wool_stairs": "minecraft:warped_stairs",
+    "minecraft:brown_concrete_slab": "minecraft:spruce_slab",
+    "minecraft:brown_wool_slab": "minecraft:spruce_slab",
+    "minecraft:brown_concrete_stairs": "minecraft:spruce_stairs",
+    "minecraft:brown_wool_stairs": "minecraft:spruce_stairs",
+    "minecraft:cyan_concrete_slab": "minecraft:oxidized_cut_copper_slab",
+    "minecraft:cyan_wool_slab": "minecraft:oxidized_cut_copper_slab",
+    "minecraft:cyan_concrete_stairs": "minecraft:oxidized_cut_copper_stairs",
+    "minecraft:cyan_wool_stairs": "minecraft:oxidized_cut_copper_stairs",
+    "minecraft:gray_concrete_slab": "minecraft:andesite_slab",
+    "minecraft:gray_wool_slab": "minecraft:andesite_slab",
+    "minecraft:gray_concrete_stairs": "minecraft:andesite_stairs",
+    "minecraft:gray_wool_stairs": "minecraft:andesite_stairs",
+    "minecraft:green_concrete_slab": "minecraft:mossy_cobblestone_slab",
+    "minecraft:green_wool_slab": "minecraft:mossy_cobblestone_slab",
+    "minecraft:green_concrete_stairs": "minecraft:mossy_cobblestone_stairs",
+    "minecraft:green_wool_stairs": "minecraft:mossy_cobblestone_stairs",
+    "minecraft:light_blue_concrete_slab": "minecraft:prismarine_brick_slab",
+    "minecraft:light_blue_wool_slab": "minecraft:prismarine_brick_slab",
+    "minecraft:light_blue_concrete_stairs": "minecraft:prismarine_brick_stairs",
+    "minecraft:light_blue_wool_stairs": "minecraft:prismarine_brick_stairs",
+    "minecraft:light_gray_concrete_slab": "minecraft:stone_slab",
+    "minecraft:light_gray_wool_slab": "minecraft:stone_slab",
+    "minecraft:light_gray_concrete_stairs": "minecraft:stone_stairs",
+    "minecraft:light_gray_wool_stairs": "minecraft:stone_stairs",
+    "minecraft:lime_concrete_slab": "minecraft:prismarine_slab",
+    "minecraft:lime_wool_slab": "minecraft:prismarine_slab",
+    "minecraft:lime_concrete_stairs": "minecraft:prismarine_stairs",
+    "minecraft:lime_wool_stairs": "minecraft:prismarine_stairs",
+    "minecraft:magenta_concrete_slab": "minecraft:purpur_slab",
+    "minecraft:magenta_wool_slab": "minecraft:purpur_slab",
+    "minecraft:magenta_concrete_stairs": "minecraft:purpur_stairs",
+    "minecraft:magenta_wool_stairs": "minecraft:purpur_stairs",
+    "minecraft:orange_concrete_slab": "minecraft:acacia_slab",
+    "minecraft:orange_wool_slab": "minecraft:acacia_slab",
+    "minecraft:orange_concrete_stairs": "minecraft:acacia_stairs",
+    "minecraft:orange_wool_stairs": "minecraft:acacia_stairs",
+    "minecraft:pink_concrete_slab": "minecraft:cherry_slab",
+    "minecraft:pink_wool_slab": "minecraft:cherry_slab",
+    "minecraft:pink_concrete_stairs": "minecraft:cherry_stairs",
+    "minecraft:pink_wool_stairs": "minecraft:cherry_stairs",
+    "minecraft:purple_concrete_slab": "minecraft:purpur_slab",
+    "minecraft:purple_wool_slab": "minecraft:purpur_slab",
+    "minecraft:purple_concrete_stairs": "minecraft:purpur_stairs",
+    "minecraft:purple_wool_stairs": "minecraft:purpur_stairs",
+    "minecraft:red_concrete_slab": "minecraft:cinnabar_brick_slab",
+    "minecraft:red_wool_slab": "minecraft:cinnabar_brick_slab",
+    "minecraft:red_concrete_stairs": "minecraft:cinnabar_brick_stairs",
+    "minecraft:red_wool_stairs": "minecraft:cinnabar_brick_stairs",
+    "minecraft:white_concrete_slab": "minecraft:quartz_slab",
+    "minecraft:white_wool_slab": "minecraft:quartz_slab",
+    "minecraft:white_concrete_stairs": "minecraft:quartz_stairs",
+    "minecraft:white_wool_stairs": "minecraft:quartz_stairs",
+    "minecraft:yellow_concrete_slab": "minecraft:polished_sulfur_slab",
+    "minecraft:yellow_wool_slab": "minecraft:polished_sulfur_slab",
+    "minecraft:yellow_concrete_stairs": "minecraft:polished_sulfur_stairs",
+    "minecraft:yellow_wool_stairs": "minecraft:polished_sulfur_stairs",
+    "minecraft:orange_poplar_leaves": "minecraft:oak_leaves",
+    "minecraft:poplar_button": "minecraft:birch_button",
+    "minecraft:poplar_door": "minecraft:birch_door",
+    "minecraft:poplar_fence": "minecraft:birch_fence",
+    "minecraft:poplar_fence_gate": "minecraft:birch_fence_gate",
+    "minecraft:poplar_hanging_sign": "minecraft:birch_hanging_sign",
+    "minecraft:poplar_log": "minecraft:birch_log",
+    "minecraft:poplar_planks": "minecraft:birch_planks",
+    "minecraft:poplar_pressure_plate": "minecraft:birch_pressure_plate",
+    "minecraft:poplar_sapling": "minecraft:birch_sapling",
+    "minecraft:poplar_shelf": "minecraft:birch_shelf",
+    "minecraft:poplar_sign": "minecraft:birch_sign",
+    "minecraft:poplar_slab": "minecraft:birch_slab",
+    "minecraft:poplar_stairs": "minecraft:birch_stairs",
+    "minecraft:poplar_trapdoor": "minecraft:birch_trapdoor",
+    "minecraft:poplar_wall_hanging_sign": "minecraft:birch_wall_hanging_sign",
+    "minecraft:poplar_wall_sign": "minecraft:birch_wall_sign",
+    "minecraft:poplar_wood": "minecraft:birch_log",
+    "minecraft:potted_poplar_sapling": "minecraft:potted_birch_sapling",
+    "minecraft:red_poplar_leaves": "minecraft:oak_leaves",
+    "minecraft:red_shrub": "minecraft:bush",
+    "minecraft:shelf_mushroom": "minecraft:cocoa",
+    "minecraft:straw_bed": "minecraft:yellow_bed",
+    "minecraft:stripped_poplar_log": "minecraft:stripped_birch_log",
+    "minecraft:stripped_poplar_wood": "minecraft:stripped_birch_wood",
+    "minecraft:yellow_poplar_leaves": "minecraft:oak_leaves",
+}
+
 # Items follow their block where there is one; these are the item-only ones.
 ITEM_FALLBACK = {
     "minecraft:music_disc_bounce": "minecraft:music_disc_cat",
@@ -660,6 +759,32 @@ def gen_blocks(rel: dict[int, Release], report: list[str]) -> str:
             approximated += 1
         report.append(f"block states 776->{client}: {approximated} approximated of {len(server_states)}")
         out.append(emit_runs(f"STATES_{client}_S2C", runs_of(mapping)))
+        # Up: every client state to the 26.2 state of the same block and
+        # properties, else the closest state of that block or of its
+        # BLOCK_FALLBACK_UP substitute (most properties in common).
+        sr = rel[SERVER]
+        server_lookup = {(b, tuple(sorted(p.items()))): i for i, (b, p) in enumerate(server_states)}
+        up: list[int | None] = []
+        approximated = 0
+        for block, props in client_states:
+            key = (block, tuple(sorted(props.items())))
+            if key in server_lookup:
+                up.append(server_lookup[key])
+                continue
+            target = block if block in sr.blocks else BLOCK_FALLBACK_UP.get(block)
+            if target is None or target not in sr.blocks:
+                die(f"{cr.name} block {block} has no equivalent in 26.2; add a BLOCK_FALLBACK_UP entry")
+            best = sr.default_state(target)
+            best_score = -1
+            for state in sr.blocks[target]["states"]:
+                sp = state.get("properties", {})
+                score = sum(1 for k, v in props.items() if sp.get(k) == v)
+                if score > best_score:
+                    best, best_score = state["id"], score
+            up.append(best)
+            approximated += 1
+        report.append(f"block states {client}->776: {approximated} approximated of {len(client_states)}")
+        out.append(emit_runs(f"STATES_{client}_C2S", runs_of(up)))
     beds = [i for i, (block, _) in enumerate(server_states) if block.endswith(BED_BLOCK_SUFFIX)]
     bed_runs = runs_of([i if i in set(beds) else None for i in range(len(server_states))])
     out.append("/// 776 block states that are beds, as `(first, _, count)` runs.\n")

@@ -128,18 +128,38 @@ impl VersionTables {
                 );
             }
         }
-        let (state_runs, state_bits) = match client {
-            Proto::V774 => (blocks::STATES_774_S2C, blocks::STATE_BITS_774),
-            Proto::V775 => (blocks::STATES_775_S2C, blocks::STATE_BITS_775),
-            Proto::V777 => (blocks::STATES_777_S2C, blocks::STATE_BITS_777),
-            Proto::V776 => (&[][..], blocks::STATE_BITS_776),
+        let (state_runs, up_runs, client_states, state_bits) = match client {
+            Proto::V774 => (
+                blocks::STATES_774_S2C,
+                blocks::STATES_774_C2S,
+                blocks::STATE_COUNT_774,
+                blocks::STATE_BITS_774,
+            ),
+            Proto::V775 => (
+                blocks::STATES_775_S2C,
+                blocks::STATES_775_C2S,
+                blocks::STATE_COUNT_775,
+                blocks::STATE_BITS_775,
+            ),
+            Proto::V777 => (
+                blocks::STATES_777_S2C,
+                blocks::STATES_777_C2S,
+                blocks::STATE_COUNT_777,
+                blocks::STATE_BITS_777,
+            ),
+            Proto::V776 => (&[][..], &[][..], 0, blocks::STATE_BITS_776),
         };
+        // Both ways are total: down, 26.2 states a client lacks show as its
+        // closest state; up, a client's states 26.2 lacks become the
+        // substitutes ViaBackwards shows (`BLOCK_FALLBACK_UP` in the
+        // generator). Vanilla packets carry states down only; Axiom's
+        // buffers carry them up.
         let block_states = if client == Proto::V776 {
             RegMap::Identity
         } else {
             RegMap::Remap {
                 s2c: IdMap::from_runs(state_runs, blocks::STATE_COUNT_776),
-                c2s: IdMap::from_runs(&[], 0),
+                c2s: IdMap::from_runs(up_runs, client_states),
             }
         };
         let bed_states = blocks::BED_STATES_776
@@ -327,7 +347,11 @@ mod tests {
 
     #[test]
     fn block_states_are_total_and_beds_are_known() {
-        for client in [Proto::V774, Proto::V775, Proto::V777] {
+        for (client, count) in [
+            (Proto::V774, blocks::STATE_COUNT_774),
+            (Proto::V775, blocks::STATE_COUNT_775),
+            (Proto::V777, blocks::STATE_COUNT_777),
+        ] {
             let t = for_client(client);
             for state in 0..blocks::STATE_COUNT_776 {
                 assert!(
@@ -335,7 +359,26 @@ mod tests {
                     "{client:?} state {state}"
                 );
             }
+            for state in 0..count {
+                let up = t.block_states.c2s(state);
+                assert!(
+                    up.is_some_and(|up| up < blocks::STATE_COUNT_776),
+                    "{client:?} state {state} up"
+                );
+            }
+            // A state both releases have goes up and back down unchanged.
+            assert_eq!(
+                t.block_states.c2s(1).and_then(|s| t.block_states.s2c(s)),
+                Some(1)
+            );
         }
+        // 26.2 lacks poplar and coloured concrete slabs: 26.3's poplar
+        // planks (27) go up as birch planks (17), a top waterlogged black
+        // concrete slab (18397) as the same blackstone slab (22236), as
+        // ViaBackwards shows them (state ids from blocks.json).
+        let t = for_client(Proto::V777);
+        assert_eq!(t.block_states.c2s(27), Some(17));
+        assert_eq!(t.block_states.c2s(18397), Some(22236));
         let t = for_client(Proto::V775);
         // 26.2 white_bed starts at 1931 (blocks.json); 16 states per colour.
         assert!(t.is_bed(1931));
